@@ -16,6 +16,6 @@ Used libraries:
 
 FW and HW has been little bit redesigned to use INTERNAL PULL\_UPs and possibility to drive LCD background light.
 
-Regional character table of RDS and DAB replaced to show correctly on LCD.
+Regional character table of RDS and DAB replaced to show correctly on LCD. Thanks to Sjef https://github.com/PE5PVB/SI4684-DAB-Receiver/tree/main
 
 ![alt text](Pictures/RadioDAB.jpg)
