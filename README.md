@@ -17,3 +17,5 @@ Used libraries:
 FW and HW has been little bit redesigned to use INTERNAL PULL\_UPs and possibility to drive LCD background light.
 
 Regional character table of RDS and DAB replaced to show correctly on LCD.
+
+![alt text](Pictures/RadioDAB.jpg)
