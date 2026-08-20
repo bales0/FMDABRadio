@@ -28,6 +28,7 @@
 //
 //                    !!!! Thank you Michael for being able to fix this problem !!!!
 // v1.71 06/06/2026 - DAB/RDS character conversion
+// v2.0  20/08/2026 - responsive Si468x core, event-driven scan and safe settings/audio control
 //
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -44,10 +45,8 @@
 // ------------------------------- Command -------------------------------------------------
 // - At first start keep <sel> pressed while powering the board : an initialization process will start - release the <sel> switch.
 // - <mode> is used to switch from DAB to FM
-// - <scan> : starts scanning of all available DAB or FM Channels (storage in the non volatile flash EEPROM)
-// - After scanning FM channels, defaut name is set to "unknown?" then a process search for valid RDS names and store them in EEPROM
-//   at the end a sort is done and channel 1 is selected.
-//   this process can be stopped just by pushing Upper Right switch. 
+// - Hold <scan> for one second to scan DAB or FM; short <scan> cancels without replacing the old list.
+// - New station lists remain in frequency/ensemble order. An FM RDS name updates only its own record.
 // - You have to choose a channel using <ch_down> and <ch_up> then <sel> to validate.
 // - Wait a few seconds, then the actual RDS name (if different from the stored name) will be permanently stored in the EEPROM for futur recall and sort will be updated.
 // - <vol+> and <vol-> to adjust the volume setting.
@@ -88,19 +87,27 @@
 #define ESP32_DEVKIT                  //for my prototype I use ESP32-DEVKIT-V4 wich affects some GPIOs definitions
 
 #include <SPI.h>
-#include "DABShield.h"                // Thank you AVIT Research and Adrian for this nice library !!!!
+#include <esp_system.h>
+#include "DABShield.h"                // Si468x core + ESP32 board/application adapter
+#include "Controls.h"
+#include "Backlight.h"
+#include "TextCodec.h"
+#include "Slideshow.h"
 #include <Adafruit_GFX.h>             // Core graphics library
 #include <Adafruit_ST7735.h>          // Hardware-specific library for ST7735
 #include <Wire.h>
 #include "SparkFun_External_EEPROM.h" // Click here to get the library: http://librarymanager/All#SparkFun_External_EEPROM
 String decodeDABString(const char* text);
+uint16_t utf8TextWidth(const String& text, uint8_t size);
+void drawUtf8Text(const String& text, int16_t x, int16_t y, uint16_t color,
+                  uint8_t size, uint16_t maxWidth);
 ExternalEEPROM extEEPROM;
 
 //---------------- Screen connection and definition -----------------------
 //
-#define TFT_CS        12         // Display chip select
-#define TFT_RST       -1         // Display reset (use of EN from ESP32)
-#define TFT_DC        25         // Display data/command select
+constexpr uint8_t TFT_CS = 12;         // Display chip select
+constexpr int8_t TFT_RST = -1;         // Display reset (use of EN from ESP32)
+constexpr uint8_t TFT_DC = 25;         // Display data/command select
 
 uint8_t screenWidth  = 160;
 uint8_t screenHeight = 128;
@@ -109,28 +116,26 @@ Adafruit_ST7735 tft  = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
 // --------- Keyboard I/O assignation ------
 //
-#define vol_up        4    // Up
-#define vol_down      5    // Down
-#define scan_sw       34   // Upright
-#define mode_sw       35   // Upleft
-#define sel           32   // Enter
-#ifdef ESP32_PICO            // Schematic
-#define ch_down       37    // Left      
-#define ch_up         38    // Right    
-#endif 
-#ifdef ESP32_DEVKIT          // My prototype
-#define ch_down       16     // Left
-#define ch_up         17     // Right
-#endif               
+constexpr uint8_t vol_up = 4;
+constexpr uint8_t vol_down = 5;
+constexpr uint8_t scan_sw = 34;
+constexpr uint8_t mode_sw = 35;
+constexpr uint8_t sel = 32;
+constexpr uint8_t ch_down = 16;
+constexpr uint8_t ch_up = 17;
 
 // ----------- DABShield I/O assignation -----
 //
-uint8_t slaveSelectPin = 13;    // CSSB (IO13) on schematic
-uint8_t SCKPin         = 18;
-uint8_t MISOPin        = 19;
-uint8_t MOSIPin        = 23;
-uint8_t pwen           = 2;
-#define resetPin         14
+constexpr uint8_t slaveSelectPin = 13;  // Si4684 SSB/CS
+constexpr uint8_t SCKPin = 18;
+constexpr uint8_t MISOPin = 19;
+constexpr uint8_t MOSIPin = 23;
+constexpr uint8_t pwen = 2;
+constexpr uint8_t resetPin = 14;
+constexpr uint8_t interruptPin = 26;
+constexpr uint8_t backlightPin = 15;
+constexpr uint8_t amplifierG0Pin = 27;
+constexpr uint8_t amplifierG1Pin = 33;
 
 // --------- Pty and audio mode of DAB channel ------
 //
@@ -176,12 +181,10 @@ char *audiomode[]  = {mode_0,mode_1,mode_2,mode_3};
 
 unsigned long lastTime = 28000;           // the last time the date time was displayed
 unsigned long timeDelay = 30000;          // update Time and Date every 30 seconds
-unsigned long lastScan = 0;               // the last time the output pin was toggled
-unsigned long scanDelay = 200;            // the scan time; increase if the output flickers
 unsigned long lastStatus = 0;             // the last time the output pin was toggled
-unsigned long statusDelay = 5000;         // update status display every 5s
-unsigned long lastRDS = 0;                // the last time the RDS name search was launched
-unsigned long timeOut = 20000;            // timeout for searching RDS name
+unsigned long statusDelay = 500;          // poll RSSI/SNR/quality twice per second
+unsigned long lastDiagnostic = 0;
+constexpr unsigned long diagnosticDelay = 5000;
 
 // ------------- Defines MAX FM and DAB channels ---------------------------
 //
@@ -208,49 +211,30 @@ uint8_t countSort = 0;                      // will be incremented writing to st
 
 struct foundChannel {
     static constexpr uint8_t NAME_MAX_LEN = 16;
-    static int compareByName(const void *s1, const void *s2) {
-        return strcmp(((foundChannel*)s1)->name, ((foundChannel*)s2)->name);
-    }
     char name[NAME_MAX_LEN + 1];
     uint8_t  param1;
     uint8_t  param2;  
     uint32_t param3;
     uint32_t param4;
-    bool     param5;    
-    foundChannel(const char * const name, const uint8_t param1, const uint8_t param2, const uint32_t param3, const uint32_t param4, const bool param5): param1(param1), param2(param2), param3(param3), param4(param4), param5(param5)
-    {
-        uint8_t len = strlen(name);
-        strncpy(this->name, name, len < NAME_MAX_LEN ? len : NAME_MAX_LEN);
-        this->name[len] = 0;
-    }
-    foundChannel() : foundChannel("", 0, 0, 0, 0, 0) {}
+    uint8_t charset;
 };
 foundChannel channels[MAX_DAB_STATIONS];
 
 struct foundChannelFM {
-    static constexpr uint8_t NAME_MAX_LEN = 16;
-    static int compareByName(const void *s1, const void *s2) {
-        return strcmp(((foundChannelFM*)s1)->name, ((foundChannelFM*)s2)->name);
-    }
+    static constexpr uint8_t NAME_MAX_LEN = 8;
     char name[NAME_MAX_LEN + 1];
-    uint8_t param1;
     uint8_t param2;  
     uint8_t param3;
     bool    param4;    
-    foundChannelFM(const char * const name, const uint8_t param1, const uint8_t param2, const uint8_t param3, const bool param4): param1(param1), param2(param2), param3(param3), param4(param4)
-    {
-        uint8_t len = strlen(name);
-        strncpy(this->name, name, len < NAME_MAX_LEN ? len : NAME_MAX_LEN);
-        this->name[len] = 0;
-    }
-    foundChannelFM() : foundChannelFM("", 0, 0, 0, 0) {}
 };
 foundChannelFM channelsFM[MAX_DAB_STATIONS];
 
 // -------------------- DAB initialization ---------------
 //
-   DAB Dab;
-   DABTime dabtime;
+DAB Dab;
+DABTime dabtime;
+Controls controls;
+Backlight backlight;
 
 // --------------------- Global variables ----------------
 //
@@ -260,11 +244,8 @@ uint32_t serviceid;
 uint32_t compid;
 uint8_t  ensemble;
 uint8_t  freq = 0;
-uint8_t  newChannel;
 uint16_t stationFM;                 // stationFM = 100*stationFM_h + stationFM_l
 bool     flag_sel;
-String   before = "before";         // used in serial prints
-String   after = "after";
 char     newFMname[9];
 //--------------------- Stored in EEPROM ------------------
 byte     totalDABchannels;   
@@ -275,526 +256,996 @@ byte     stationFM_l;
 byte     stationFM_h;       
 byte     flag_name_FM;
 byte     dabMode;
+byte     dabCharset;
 char     fmName[9];
 char     dabName[17];
 
 // ------------------------ Setup -------------------------------
 //
+bool scanStartPending = false;
+
+enum class ScanState : uint8_t {
+  Idle,
+  MuteWait,
+  DabTuneStart,
+  DabTuneWait,
+  DabServiceListWait,
+  FmTuneStart,
+  FmTuneWait,
+  FmSeekStart,
+  FmSeekWait,
+  FmRdsTuneStart,
+  FmRdsTuneWait,
+  FmRdsWait,
+  Commit,
+  Summary
+};
+
+ScanState scanState = ScanState::Idle;
+bool scanCancelRequested = false;
+bool scanBandSwitchPending = false;
+uint8_t scanDabIndex = 0;
+uint8_t scanCommitIndex = 0;
+uint8_t scanRdsIndex = 0;
+uint32_t scanStateDeadlineMs = 0;
+uint16_t scanLastFmFrequency = 0;
+uint16_t scanPreviousFmFrequency = 0;
+uint32_t scanPreviousDabServiceId = 0;
+uint32_t scanPreviousDabComponentId = 0;
+
+enum class UiView : uint8_t {
+  Text,
+  Slideshow,
+  Tech,
+  StationList,
+  Menu
+};
+
+enum UiDirtyRegion : uint8_t {
+  UI_DIRTY_NONE = 0,
+  UI_DIRTY_HEADER = 1U << 0,
+  UI_DIRTY_STATION = 1U << 1,
+  UI_DIRTY_TEXT = 1U << 2,
+  UI_DIRTY_STATUS = 1U << 3,
+  UI_DIRTY_SIGNAL = 1U << 4,
+  UI_DIRTY_TECH = 1U << 5,
+  UI_DIRTY_FULL = 1U << 7
+};
+
+struct UiSettings {
+  uint8_t brightness = 100;
+  uint8_t dimLevel = 20;
+  uint8_t dimTimeoutIndex = 1;  // 15, 30, 60 or 120 seconds.
+  uint8_t techEnabled = 1;
+  uint8_t defaultView = 0;
+  uint8_t slideshowMode = 1;    // 0=off, 1=manual screen, 2=auto.
+  uint8_t slideshowLayout = 0;  // 0=status strip, 1=full screen.
+};
+
+enum class UiAccent : uint8_t {
+  None,
+  Acute,
+  Grave,
+  Caron,
+  Umlaut,
+  Circumflex,
+  Ring,
+  Tilde,
+  Cedilla,
+  Macron,
+  Breve,
+  DotAbove,
+  DoubleAcute,
+  Ogonek,
+  Stroke,
+  MiddleDot
+};
+
+enum class UiSpecialGlyph : uint8_t {
+  None,
+  LeftGuillemet,
+  RightGuillemet,
+  InvertedExclamation,
+  InvertedQuestion,
+  Pound,
+  Euro,
+  Copyright,
+  AEUpper,
+  AELower,
+  OEUpper,
+  OELower,
+  EthUpper,
+  EthLower,
+  ThornUpper,
+  ThornLower,
+  SharpS,
+  EngUpper,
+  EngLower,
+  IJUpper,
+  IJLower,
+  Beta,
+  Macron,
+  HorizontalBar
+};
+
+struct UiGlyph {
+  char base;
+  UiAccent accent;
+  UiSpecialGlyph special;
+
+  UiGlyph(char baseValue, UiAccent accentValue,
+          UiSpecialGlyph specialValue = UiSpecialGlyph::None)
+      : base(baseValue), accent(accentValue), special(specialValue) {}
+};
+
+UiSettings uiSettings;
+UiView uiView = UiView::Text;
+uint8_t uiDirtyFlags = UI_DIRTY_NONE;
+UiView uiViewBeforeModal = UiView::Text;
+bool stationPreviewActive = false;
+bool openListAfterBandReady = false;
+uint8_t stationListSelection = 1;
+uint8_t stationListTop = 1;
+uint8_t menuSelection = 0;
+uint8_t menuTop = 0;
+String uiBroadcastText;
+uint16_t uiBroadcastTextGlyphs = 0;
+String uiBroadcastLoopText;
+uint16_t uiBroadcastLoopGlyphs = 0;
+uint16_t uiTextScrollGlyph = 0;
+uint32_t uiTextPageDeadlineMs = 0;
+uint16_t uiStationScrollGlyph = 0;
+uint32_t uiStationScrollDeadlineMs = 0;
+bool uiStationScrollEndHold = false;
+bool uiSlideshowDecodePending = false;
+bool uiDefaultSlideshowPending = false;
+
 void setup() {
-  pinMode(pwen, OUTPUT);                     // DABshield I/O
-  digitalWrite(pwen, LOW);                   // Power OFF DABshield
+  backlight.begin(backlightPin, millis());
+  Dab.configureAudioPins(amplifierG0Pin, amplifierG1Pin);
 
-  pinMode(slaveSelectPin, OUTPUT);
-  // digitalWrite(slaveSelectPin, HIGH);
-  pinMode(resetPin, OUTPUT);
-  // digitalWrite(resetPin, LOW);
-  
-  pinMode(vol_up, INPUT_PULLUP);                    // keyboard inputs
-  pinMode(vol_down, INPUT_PULLUP);
-  pinMode(ch_down, INPUT_PULLUP);
-  pinMode(ch_up, INPUT_PULLUP);
-  pinMode(sel, INPUT_PULLUP);
-  pinMode(mode_sw, INPUT);
-  pinMode(scan_sw, INPUT);
+  Serial.begin(115200);
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const char* resetReasonLabel = "unknown";
+  switch (resetReason) {
+    case ESP_RST_POWERON: resetReasonLabel = "power-on"; break;
+    case ESP_RST_EXT: resetReasonLabel = "external"; break;
+    case ESP_RST_SW: resetReasonLabel = "software"; break;
+    case ESP_RST_PANIC: resetReasonLabel = "panic"; break;
+    case ESP_RST_INT_WDT: resetReasonLabel = "interrupt-watchdog"; break;
+    case ESP_RST_TASK_WDT: resetReasonLabel = "task-watchdog"; break;
+    case ESP_RST_WDT: resetReasonLabel = "watchdog"; break;
+    case ESP_RST_DEEPSLEEP: resetReasonLabel = "deep-sleep"; break;
+    case ESP_RST_BROWNOUT: resetReasonLabel = "brownout"; break;
+    case ESP_RST_SDIO: resetReasonLabel = "sdio"; break;
+    default: break;
+  }
+  Serial.printf("[APP] reset reason=%d (%s)\n",
+                static_cast<int>(resetReason), resetReasonLabel);
+  SPI.begin(SCKPin, MISOPin, MOSIPin);
+  controls.begin(vol_up, vol_down, scan_sw, mode_sw, sel, ch_down, ch_up);
 
-  pinMode(15, OUTPUT);                       // display background LED
-  digitalWrite(15, HIGH);
-
-  pinMode(27, OUTPUT);                       // G0 headphone amplifier gain
-  digitalWrite(27, HIGH);
-  pinMode(33, OUTPUT);                       // G1
-  digitalWrite(33, HIGH);
-
-  Serial.begin(115200);                      // Initialise the terminal
-  while(!Serial);
-   
-  SPI.begin();
-
-  tft.initR(INITR_BLACKTAB);                 // Initialize ST7735R screen
+  tft.initR(INITR_BLACKTAB);
   tft.setRotation(3);
-  tft.setTextWrap(0);
+  tft.setTextWrap(false);
   clearScreen();
-
-  TFT_aff("Hello DAB+ !",25);
+  TFT_aff("Hello DAB+ !", 25);
   tft.setTextColor(ST77XX_WHITE);
-  Message("(c)2026* Y.Bourdon",60);
-  Message("Version 1.71 06.06.2026",75);
+  Message("(c)2026* Y.Bourdon", 60);
+  Message("Si468x responsive core", 75);
 
+  Serial.println("[APP] FMDABRadio responsive startup");
   Serial.println("EEPROM FM first byte     : " + String(ADDR_FM_CHANNEL));
   Serial.println("EEPROM FM last byte      : " + String(MAX_FM_STATIONS * 13 + ADDR_FM_CHANNEL - 1));
   Serial.println("EEPROM DAB first byte    : " + String(ADDR_DAB_CHANNEL));
-  Serial.println("EEPROM DAB last byte     : " + String(MAX_DAB_STATIONS * 28+ ADDR_DAB_CHANNEL - 1));
+  Serial.println("EEPROM DAB last byte     : " + String(MAX_DAB_STATIONS * 28 + ADDR_DAB_CHANNEL - 1));
   Serial.println("Minimum EEPROM size      : " + String(EEPROM_SIZE));
-  
+
   tft.setTextColor(ST77XX_GREEN);
-
   startEEPROM();
-  if(extEEPROM.begin() == false)
-  {
-    Message_red("No EEPROM detected ",110);
-    while(true);                                // no EEPROM freezing .....
-  }
-  else  
-  {
-    tft.setTextColor(ST77XX_GREEN);
-    Message("I2C EEPROM connected",97);  
-    extEEPROM.setMemorySize(256000 / 8); //AT24C256 (256k bit)
-    Serial.println("EEPROM size in bytes     : " + String(extEEPROM.length()) + "\n");
+  Message("I2C EEPROM connected", 97);
+
+  if (!digitalRead(sel)) {
+    cleanEEPROM();
+    totalFMchannels = 0;
+    totalDABchannels = 0;
+    while (!digitalRead(sel)) {
+      delay(1);
+    }
   }
 
-  Dab.setCallback(ServiceData);                 // DAB Setup
-  Dab.begin();
-  if(Dab.error != 0)
-  {
-    Message_red("Si4684:check connections",110);
-    while(true);                                // no DABShield freezing .....
+  lastEEPROM();
+  loadUiSettings();
+  static const uint16_t dimTimeoutSeconds[] = {15, 30, 60, 120};
+  backlight.configure(uiSettings.brightness, uiSettings.dimLevel,
+                      static_cast<uint32_t>(
+                          dimTimeoutSeconds[uiSettings.dimTimeoutIndex]) * 1000UL);
+  uiView = uiSettings.defaultView == 1 && uiSettings.techEnabled
+               ? UiView::Tech
+               : UiView::Text;
+  uiDefaultSlideshowPending = dabMode == 1 &&
+                              uiSettings.defaultView == 2 &&
+                              uiSettings.slideshowMode != 0;
+  if (vol > 75) {
+    vol = 57;
+    saveVolumeToEEPROM(vol);
   }
-  else  
-  {
-    tft.setTextColor(ST77XX_GREEN);
-    Message("Si4684 connected",110); 
+  if (dabMode > 1) {
+    dabMode = 0;
+    saveModeToEEPROM(dabMode);
   }
-  delay(2000);
-
-  clearScreen();
-  if(!digitalRead(sel)) {                      // init EEPROM if <sel> at startup                                    
-       cleanEEPROM();                   
-       cleanChannels(MAX_DAB_STATIONS);
-       totalFMchannels = MAX_FM_STATIONS;
-       totalDABchannels = MAX_DAB_STATIONS;
-       ListChannels();
-  }   
-  do {
-  } while (!digitalRead(sel));                  
- 
-  lastEEPROM();                                // read back : vol, dabMode, currentDABchannel, totalDABchannels, currentFMchannel, totalFMchannels
   displayLast();
-  ListChannels();                              // list of FM and DAB channels on serial port
+  ListChannels();
+
+  Dab.configurePins(slaveSelectPin, interruptPin, resetPin, pwen);
+  Dab.setDiagnostics(&Serial);
+  Dab.setCallback(ServiceData);
+  if (!Dab.setSlideshowEnabled(uiSettings.slideshowMode != 0)) {
+    uiSettings.slideshowMode = 0;
+    Serial.println("[SLS][WARN] slideshow disabled because RAM allocation failed");
+  }
 
   clearScreen();
-  if (dabMode == 1){                           // DAB mode
-     TFT_aff("DAB mode", 40);
-     Dab.begin(0);
-     if(totalDABchannels != 0){
-        delay(500);
-        clearScreen();
-        DAB_SetChannel();                      // select current channel
-     }else{
-        TFT_aff("Please Scan!",65);
-     }
-  }else{
-     TFT_aff("FM mode", 40);
-     Dab.begin(1);
-     if(totalFMchannels != 0){
-        delay(500);
-        clearScreen();
-        FMsetChannel(currentFMchannel, 1);    // select currentFMchannel and displays name
-     }else{
-        TFT_aff("Please Scan!",65);
-     }       
-  }  
+  TFT_aff(dabMode == 1 ? "Starting DAB" : "Starting FM", 40);
+  if (!Dab.beginAsync(dabMode == 1 ? 0 : 1)) {
+    Message_red("Radio start failed", 65);
+  }
 }
-
-
-// ------------------------------------ Loop ---------------------------------------------------
-//
 void loop() {
-  
- Dab.task();
-  
- if ((millis() - lastScan) > scanDelay) {                              // scan every 200mS
-    lastScan = millis();
-    if (!digitalRead(vol_up)) { //volume up
-         if (vol < 63)
-            {
-              vol++;
-              Volume();
-              Dab.vol(vol);
-              saveVolumeToEEPROM(vol);
-              Serial.printf("Volume set to: %d/63\n", vol);
-            }
-            
-    }else if (!digitalRead(vol_down)) {                                // volume down 
-          if (vol > 0) 
-          {
-            vol--;
-            Volume();
-            Dab.vol(vol);
-            saveVolumeToEEPROM(vol);
-            Serial.printf("Volume set to: %d/63\n", vol);
-          }
-     
-    }else if(!digitalRead(scan_sw)) {                                  // scanning channels
-        clearScreen();
-        TFT_aff("Scanning ...", 20);
-        if (dabMode == 1){
-          DAB_scan();                                                  // scan DAB channels
-          if (totalDABchannels !=0) DAB_SetChannel();                  // select current channel
-        }else{
-          FM_scan();                                                   // scan FM chanels
-          if (totalFMchannels !=0) FMsetChannel(currentFMchannel, 1);  // select currentFMchannel and displays name
-        }
-  
-    }else if(!digitalRead(ch_up)) {
-       if (dabMode == 1){                                              // DAB mode
-         if(totalDABchannels != 0) {
-           if (currentDABchannel < totalDABchannels){
-             currentDABchannel++;
-             DABreadEEPROM(currentDABchannel);
-             DAB_affNum();
-             TFT_aff(dabName, 8);
-           }
-         }
-       }else{
-         if(totalFMchannels != 0) {
-            if (currentFMchannel < totalFMchannels){
-               currentFMchannel++;
-               FMreadEEPROM(currentFMchannel);
-               FM_affNum();
-               Aff_FM_freq();
-               FM_name(fmName, 8);
-               flag_sel = 0;
-            }
-         }
-       }
-  
-    }else if(!digitalRead(ch_down)) {
-       if (dabMode == 1){ 
-        if(totalDABchannels != 0) {
-          if (currentDABchannel >1){
-             currentDABchannel--;
-             DABreadEEPROM(currentDABchannel);
-             DAB_affNum();
-             TFT_aff(dabName, 8);
-          }
-        }
-       }else{
-          if(totalFMchannels != 0) {
-            if (currentFMchannel >1){
-               currentFMchannel--;
-               FMreadEEPROM(currentFMchannel);
-               FM_affNum();
-               Aff_FM_freq();
-               FM_name(fmName, 8);
-               flag_sel = 0;
-            }
-          }
-       }
-       
-    }else if(!digitalRead(sel)) {                                         // select currentChannel
-       if (dabMode == 1){                                                 // DAB mode
-          if(totalDABchannels != 0) {
-             clearScreen();
-             saveCurrentDABChannelToEEPROM(currentDABchannel);  
-             DAB_SetChannel();   
-          }
-       }else{
-          if(totalFMchannels != 0) {
-             clearScreen();
-             flag_sel = 1;
-             saveCurrentFMchannelToEEPROM(currentFMchannel); 
-             FMsetChannel(currentFMchannel, 1);                          // select currentFMchannel and displays name     
-          }   
-       }             
+  Dab.task();
 
-    }else if(!digitalRead(mode_sw)) {                                    // select mode DAB/FM
-          clearScreen();
-          dabMode = !dabMode;
-          saveModeToEEPROM(dabMode);    
-          lastEEPROM();
-          if (dabMode == 1){                                             // DAB mode
-             TFT_aff("DAB mode", 50);
-             delay(500);
-             Dab.begin(0);
-             clearScreen();            
-             if(totalDABchannels != 0){
-                DAB_SetChannel();                                       // select current channel
-             }else{
-                TFT_aff("Please Scan!",50);
-             }
-         }else{
-             TFT_aff("FM mode", 50);
-             delay(500);
-             Dab.begin(1);
-             clearScreen();
-             if(totalFMchannels != 0){
-                FMsetChannel(currentFMchannel, 1);                     // select currentFMchannel and displays name
-             }else{
-               TFT_aff("Please Scan!",50);
-             }                  
-         }
-    }
-         
- }else if ((millis() - lastTime) > timeDelay) {                       // updates Time and Date and Status every 30 seconds
-    if (dabMode == 1){                                                // DAB mode
-       DAB_time();
-    }else{
-       FM_time();
-    }
-    lastTime = millis();
-    
- }else if ((millis() - lastStatus) > statusDelay) {                   // updates  Status every 1 second
-    if (dabMode == 1){                                                // DAB mode
-            DAB_status();
-         }else{
-            FM_status();
-            ServiceData();                                            // check for service data and displays
-    }
-    lastStatus = millis();
- }
-       
+  const uint32_t now = millis();
+  backlight.service(now);
+  commitDirtySettingsIfDue();
+  controls.poll(now);
+  ButtonEvent event;
+  while (controls.pop(event)) {
+    handleButtonEvent(event);
+  }
 
- if (dabMode == 0){                                                  // only for FM mode
-    if(flag_sel) {                                                   // sel switch was pressed
-      if (String(Dab.ps).length() != 0) {
-           String tmp = decodeDABString(Dab.ps);
-           tmp.trim();
-           while(tmp.length() < 8){ tmp += " "; }
-           tmp.substring(0,8).toCharArray(newFMname,9);
-           FM_name(newFMname, 8);                                       // displays FM name once
-           flag_name_FM = 1;
-           String nameString = decodeDABString(Dab.ps);                       // name can be "   FIP    " or "FIP     " or "      FIP"....
-           nameString.trim();                                        // trim it
-           uint8_t l = nameString.length();
-           if (l < 8){
-              for (uint8_t j=l; j<8; j++){
-                 nameString = nameString + " ";
-              }
-           }
-           nameString.toCharArray(newFMname,9);          
-           if (String(fmName) != nameString){                                // EEPROM RDS name is different from updated RDS name
-              saveFMnameToEEPROM(currentFMchannel,flag_name_FM, newFMname);  // save data with formated RDS name
-              clearScreen();
-              TFT_aff(newFMname, 8);
-              TFT_aff("Sorting ...", 40);
-              sortFMchannels();                                              // RDS name list has changed so sort it
-              listStations(after);
-              clearScreen();
-              findFMstation();                                               // search new channel number
-              Serial.println("new Channel: " + String(newChannel));
-              currentFMchannel = newChannel;                                 // set to new channel number (after sorting)
-              saveCurrentFMchannelToEEPROM(currentFMchannel);                
-              FMsetChannel(currentFMchannel, 1);                             // select currentFMchannel and displays name 
-           }
-           flag_sel = 0;                                                     // updates only once
-     }       
+  if (scanStartPending && digitalRead(scan_sw) == HIGH) {
+    scanStartPending = false;
+    beginFullScan();
+  }
+
+  handleRadioEvents();
+  serviceScan(now);
+  serviceUi(now);
+
+  if (!scanActive() && Dab.ready() && (now - lastTime) > timeDelay) {
+    if (dabMode == 1) {
+      DAB_time();
+    } else {
+      FM_time();
     }
- }  
-             
-}                                                                            // end of void loop
+    lastTime = now;
+  }
 
+  if (!scanActive() && Dab.ready() && (now - lastStatus) > statusDelay) {
+    if (dabMode == 1) {
+      DAB_status();
+    } else {
+      FM_status();
+    }
+    lastStatus = now;
+    if (now - lastDiagnostic >= diagnosticDelay) {
+      Serial.printf("[DIAG] state=%s IRQ=%lu cmdErrors=%lu dsrvOverflow=%lu droppedKeys=%lu\n",
+                    Dab.stateName(), static_cast<unsigned long>(Dab.irqCount()),
+                    static_cast<unsigned long>(Dab.commandErrorCount()),
+                    static_cast<unsigned long>(Dab.dsrvOverflowCount()),
+                    static_cast<unsigned long>(controls.droppedEvents()));
+      lastDiagnostic = now;
+    }
+  }
 
-void findFMstation(void) {
-  //countSort--;
-  for (int i = 0; i <= countSort; i++)
-  {
-    foundChannelFM *s = &channelsFM[i]; 
-    if(strcmp(s->name , newFMname) == 0 ) {
-       newChannel = i+1;
-       break;
+  if (!scanActive()) processFmNameUpdate();
+}
+
+void handleButtonEvent(const ButtonEvent& event) {
+  const uint32_t now = millis();
+  backlight.noteActivity(now);
+
+  const bool stepEvent = event.type == ButtonEventType::ShortPress ||
+                         event.type == ButtonEventType::Repeat;
+
+  if (handleUiButtonEvent(event)) return;
+
+  if (event.button == ButtonId::VolumeUp && stepEvent) {
+    if (vol < 75) {
+      ++vol;
+      Volume();
+      if (!scanActive()) Dab.requestVolume(vol);
+      saveVolumeToEEPROM(vol);
+      Serial.printf("[KEY] volume=%u/75\n", vol);
+    }
+    return;
+  }
+
+  if (event.button == ButtonId::VolumeDown && stepEvent) {
+    if (vol > 0) {
+      --vol;
+      Volume();
+      if (!scanActive()) Dab.requestVolume(vol);
+      saveVolumeToEEPROM(vol);
+      Serial.printf("[KEY] volume=%u/75\n", vol);
+    }
+    return;
+  }
+
+  if (event.button == ButtonId::ChannelUp && stepEvent) {
+    if (scanActive()) return;
+    previewStation(1);
+    return;
+  }
+
+  if (event.button == ButtonId::ChannelDown && stepEvent) {
+    if (scanActive()) return;
+    previewStation(-1);
+    return;
+  }
+
+  if (event.button == ButtonId::Band &&
+      event.type == ButtonEventType::ShortPress) {
+    if (scanActive()) {
+      cancelFullScan(true);
+      return;
+    }
+    if (!Dab.ready()) {
+      Serial.println("[KEY] band switch ignored while radio is busy");
+      return;
+    }
+    dabMode = !dabMode;
+    uiSlideshowDecodePending = false;
+    uiDefaultSlideshowPending = dabMode == 1 &&
+                                uiSettings.defaultView == 2 &&
+                                uiSettings.slideshowMode != 0;
+    uiView = uiSettings.defaultView == 1 && uiSettings.techEnabled
+                 ? UiView::Tech : UiView::Text;
+    stationPreviewActive = false;
+    saveModeToEEPROM(dabMode);
+    clearScreen();
+    TFT_aff(dabMode == 1 ? "Starting DAB" : "Starting FM", 40);
+    Dab.beginAsync(dabMode == 1 ? 0 : 1);
+    return;
+  }
+
+  if (event.button == ButtonId::Scan) {
+    if (scanActive()) {
+      if (event.type == ButtonEventType::ShortPress) cancelFullScan(false);
+      return;
+    }
+    if (event.type == ButtonEventType::LongPress) {
+      scanStartPending = true;
+      Serial.println("[KEY] full scan armed; starts on key release");
+    } else if (event.type == ButtonEventType::ShortPress) {
+      openStationList();
+    }
+    return;
+  }
+
+  if (event.button == ButtonId::Select) {
+    if (scanActive()) return;
+    if (event.type == ButtonEventType::LongPress) {
+      openSettingsMenu();
+      return;
+    }
+    if (event.type != ButtonEventType::ShortPress || !Dab.ready()) return;
+    if (!stationPreviewActive) {
+      cycleUiScreen();
+    } else if (dabMode == 1 && totalDABchannels != 0) {
+      stationPreviewActive = false;
+      saveCurrentDABChannelToEEPROM(currentDABchannel);
+      DAB_SetChannel();
+    } else if (dabMode == 0 && totalFMchannels != 0) {
+      stationPreviewActive = false;
+      flag_sel = true;
+      saveCurrentFMchannelToEEPROM(currentFMchannel);
+      FMsetChannel(currentFMchannel, true);
     }
   }
 }
 
-
-void DAB_scan(void)
-{
-  uint8_t freq_index;
-  char freqstring[32];
-  char nameString[17];  
-  totalDABchannels = 0;
-  countSort = 0;
-  Serial.println("\nSearching DAB channels ...");
-  for (freq_index = 0; freq_index < DAB_FREQS; freq_index++)
-  {  
-    sprintf(freqstring, "Freq %02d/37   %03d.%03d MHz", freq_index, (uint16_t)(Dab.freq_khz(freq_index) / 1000), (uint16_t)(Dab.freq_khz(freq_index) % 1000));
-    tft.setTextColor(ST77XX_GREEN);                                                     // green display
-    Aff_Scan_Freq(freqstring,50);
-    Dab.tune(freq_index);
-    Serial.print("Ensemble: ");
-    Serial.println(freq_index);
-    if(Dab.servicevalid() == 1)
-    {
-       tft.setTextColor(ST77XX_GREEN);                                                  // green display
-       Aff_Scan_Freq(Dab.Ensemble,65);   
-       for (uint8_t i = 0; i < Dab.numberofservices; i++)
-       {
-          serviceid = Dab.service[i].ServiceID;                                         // identifier for station
-          compid = Dab.service[i].CompID;                                               // identifier for station, not sure if needed at al
-          String nameString = String(Dab.service[i].Label);                             // name can be "FIP    " or "  FIP  "
-          nameString.trim();
-          uint8_t l = nameString.length();
-          if (l < 16){
-              for (uint8_t j = l; j <= 16; j++){
-                 nameString = nameString + " ";
-              }
-          } 
-          if (l == 0) nameString = "unknown?        ";  
-          nameString.toCharArray(dabName,17);
-          Serial.print(countSort+1);
-          Serial.print(">\t");
-          Serial.print(dabName);  
-          Serial.print("\t ServiceID: ");
-          Serial.print(serviceid);
-          Serial.print("\t CompID: ");
-          Serial.println(compid);
-          tft.setTextColor(ST77XX_WHITE);                                                             // white display
-          Aff_Scan_Name(dabName,100);
-          totalDABchannels++;                                                                         // total number of received channels from 1 to n                                                                                  
-          if (countSort < MAX_DAB_STATIONS) addStation(dabName,freq_index,i, serviceid, compid, 0);   // from 0 to n-1                                                                                    
-          Aff_Scan_Service(totalDABchannels, 85);           
-       }
+void previewStation(int8_t direction) {
+  if (dabMode == 1) {
+    if (totalDABchannels == 0) return;
+    if (direction > 0 && currentDABchannel < totalDABchannels) {
+      ++currentDABchannel;
+    } else if (direction < 0 && currentDABchannel > 1) {
+      --currentDABchannel;
+    } else {
+      return;
     }
+    stationPreviewActive = true;
+    uiView = UiView::Text;
+    DABreadEEPROM(currentDABchannel);
+    renderListeningScreen();
+  } else {
+    if (totalFMchannels == 0) return;
+    if (direction > 0 && currentFMchannel < totalFMchannels) {
+      ++currentFMchannel;
+    } else if (direction < 0 && currentFMchannel > 1) {
+      --currentFMchannel;
+    } else {
+      return;
+    }
+    stationPreviewActive = true;
+    uiView = UiView::Text;
+    FMreadEEPROM(currentFMchannel);
+    renderListeningScreen();
+    flag_sel = false;
   }
-  saveTotalDABchannelToEEPROM(totalDABchannels);                                                      // end of scan
-  clearScreen();
+}
 
-  if(totalDABchannels != 0) {
-      TFT_aff("Channels", 8);
-      TFT_aff("Sorting ...", 40);
-      sortStations();                                                                                // sort channels array
-      listStations(after);
-      for (uint8_t i = 0; i < totalDABchannels; i++)
-      {
-        foundChannel *s = &channels[i];
-        saveDABchannelToEEPROM(i+1, s->param1, s->param2, s->param3, s->param4, s->name);            // save to EEPROM
-        delay(10);
+void handleRadioEvents() {
+  if (Dab.takeBandReady()) {
+    clearScreen();
+    Serial.printf("[APP] %s image ready\n", dabMode == 1 ? "DAB" : "FM");
+    if (dabMode == 1) {
+      if (totalDABchannels != 0) {
+        DAB_SetChannel();
+      } else {
+        TFT_aff("Please Scan!", 50);
       }
-      cleanChannels(totalDABchannels);                               
-      currentDABchannel = 1;                                                                         // we use the first available service
-      saveCurrentDABChannelToEEPROM(currentDABchannel);  
+    } else {
+      if (totalFMchannels != 0) {
+        FMsetChannel(currentFMchannel, true);
+      } else {
+        TFT_aff("Please Scan!", 50);
+      }
+    }
+    if (openListAfterBandReady) {
+      openListAfterBandReady = false;
+      openStationList();
+    }
+  }
+
+  RadioOperation operation;
+  bool success;
+  while (Dab.takeOperationResult(operation, success)) {
+    Serial.printf("[APP] radio operation=%u result=%s\n",
+                  static_cast<unsigned>(operation), success ? "ok" : "failed");
+    if (handleScanRadioResult(operation, success)) continue;
+    if (!success && operation == RadioOperation::BandBoot) {
       clearScreen();
-  }else{
-      clearScreen();
-      TFT_aff("No channel !",55);
-      currentDABchannel = 0;                                                                        // no available service
-      saveCurrentDABChannelToEEPROM(currentDABchannel);  
+      Message_red("Radio start failed", 55);
+    } else if (!success) {
+      Serial.println("[APP][WARN] recoverable radio operation failed; display kept intact");
+    }
   }
 }
 
-void FM_scan(void)                                                                            // 1st step : searching and storing all avalable FM channels (RSSi and SNR are good enough)
-{
-  uint16_t startfreq = Dab.freq; 
-  uint8_t m;  
-  uint8_t i ,j, k;
-  bool flagTimeout = 0;
-  bool n;
-  Serial.println("\nSearching FM channels ...");
-  Dab.vol(0);
-  Dab.tune((uint16_t)8750);
-  totalFMchannels = 0;
-  char FMname[9] = "unknown?";
-  while(Dab.seek(1, 0) == 1)
-  {
-    totalFMchannels++;
-    countSort = totalFMchannels - 1;
-    saveFMchannelToEEPROM(totalFMchannels, (Dab.freq%100)/10, Dab.freq/100, 0, FMname);        // save channel, freq_l, freq_h, flag=0 (no RDS name), "unknown?"
-    addStationFM(FMname,totalFMchannels, (Dab.freq%100)/10, Dab.freq/100, 0);                  // save data in channels buffer
-    char freqstring[24];  
-    sprintf(freqstring, "Freq : %3d.%1d MHz",  Dab.freq / 100, (Dab.freq %100)/10);
-    Serial.print(totalFMchannels);
-    Serial.print(">\t");
-    Serial.println(freqstring);
-    tft.setTextColor(ST77XX_GREEN);                                                            // green display
-    Aff_Scan_Freq(freqstring, 60);
-    Aff_Scan_Service(totalFMchannels, 80);    
-    if(Dab.freq == 10790){
+void normalizeFmPs(const char* source, char destination[9]) {
+  uint8_t first = 0;
+  while (first < 8 && source[first] == ' ') ++first;
+  uint8_t last = 8;
+  while (last > first && (source[last - 1] == ' ' || source[last - 1] == 0)) {
+    --last;
+  }
+  memset(destination, ' ', 8);
+  if (last > first) memcpy(destination, source + first, last - first);
+  destination[8] = 0;
+}
+
+void processFmNameUpdate() {
+  if (dabMode != 0 || !flag_sel || strlen(Dab.ps) == 0) return;
+
+  normalizeFmPs(Dab.ps, newFMname);
+  const bool nameChanged = memcmp(fmName, newFMname, 8) != 0;
+  const bool nameWasStored = flag_name_FM != 0;
+  flag_name_FM = 1;
+
+  if (nameChanged || !nameWasStored) {
+    saveFMnameToEEPROM(currentFMchannel, flag_name_FM, newFMname);
+    Serial.printf("[RDS] PS stored for FM channel %u without reordering database\n",
+                  currentFMchannel);
+  }
+  memcpy(fmName, newFMname, sizeof(fmName));
+  if (uiView == UiView::Text) {
+    resetUiStationScroll();
+    markUiDirty(UI_DIRTY_STATION);
+  } else if (uiView == UiView::StationList) {
+    renderStationList();
+  }
+  flag_sel = false;
+}
+
+
+bool scanActive() {
+  return scanState != ScanState::Idle;
+}
+
+void drawScanProgress(uint8_t percent) {
+  if (percent > 100) percent = 100;
+  constexpr uint8_t x = 8;
+  constexpr uint8_t y = 116;
+  constexpr uint8_t width = 144;
+  tft.drawRect(x, y, width, 7, ST77XX_WHITE);
+  const uint8_t filled = static_cast<uint8_t>((width - 2) * percent / 100);
+  tft.fillRect(x + 1, y + 1, width - 2, 5, ST77XX_BLACK);
+  if (filled != 0) tft.fillRect(x + 1, y + 1, filled, 5, ST77XX_GREEN);
+}
+
+void renderDabScanFrequency() {
+  char text[28];
+  const uint32_t frequency = Dab.freq_khz(scanDabIndex);
+  snprintf(text, sizeof(text), "DAB %u/%u  %lu.%03lu",
+           scanDabIndex + 1, DAB_FREQS,
+           static_cast<unsigned long>(frequency / 1000),
+           static_cast<unsigned long>(frequency % 1000));
+  tft.setTextColor(ST77XX_GREEN);
+  Aff_Scan_Freq(text, 50);
+  drawScanProgress(static_cast<uint8_t>(scanDabIndex * 100U /
+                                        (DAB_FREQS - 1)));
+}
+
+void renderFmScanFrequency(uint16_t frequency) {
+  char text[24];
+  snprintf(text, sizeof(text), "FM %u.%02u MHz", frequency / 100,
+           frequency % 100);
+  tft.setTextColor(ST77XX_GREEN);
+  Aff_Scan_Freq(text, 55);
+  uint8_t progress = 0;
+  if (frequency > 8750) {
+    progress = static_cast<uint8_t>(
+        (static_cast<uint32_t>(frequency - 8750) * 100U) / (10790 - 8750));
+  }
+  drawScanProgress(progress);
+}
+
+void beginFullScan() {
+  if (scanActive() || !Dab.ready()) {
+    Serial.println("[SCAN][WARN] scan start rejected while radio is busy");
+    return;
+  }
+
+  scanCancelRequested = false;
+  scanBandSwitchPending = false;
+  scanDabIndex = 0;
+  scanCommitIndex = 0;
+  scanRdsIndex = 0;
+  scanLastFmFrequency = 0;
+  scanPreviousFmFrequency = 0;
+  scanPreviousDabServiceId = 0;
+  scanPreviousDabComponentId = 0;
+  countSort = 0;
+
+  if (dabMode == 1 && totalDABchannels != 0 &&
+      currentDABchannel >= 1 && currentDABchannel <= totalDABchannels) {
+    const byte previousChannel = currentDABchannel;
+    DABreadEEPROM(previousChannel);
+    currentDABchannel = previousChannel;
+    scanPreviousDabServiceId = serviceid;
+    scanPreviousDabComponentId = compid;
+  } else if (dabMode == 0 && totalFMchannels != 0 &&
+             currentFMchannel >= 1 && currentFMchannel <= totalFMchannels) {
+    const byte previousChannel = currentFMchannel;
+    FMreadEEPROM(previousChannel);
+    currentFMchannel = previousChannel;
+    scanPreviousFmFrequency = 100U * stationFM_h + 10U * stationFM_l;
+  }
+
+  clearScreen();
+  TFT_aff(dabMode == 1 ? "DAB scanning" : "FM scanning", 12);
+  tft.setTextColor(ST77XX_YELLOW);
+  Message("Short SCAN cancels", 32);
+  Aff_Scan_Service(0, 85);
+  drawScanProgress(0);
+  Dab.requestVolume(0);
+  scanState = ScanState::MuteWait;
+  scanStateDeadlineMs = millis() + 1;
+  Serial.printf("[SCAN] %s full scan started; old database retained until commit\n",
+                dabMode == 1 ? "DAB" : "FM");
+}
+
+void cancelFullScan(bool switchBand) {
+  if (!scanActive()) return;
+  scanBandSwitchPending |= switchBand;
+  if (scanState == ScanState::Commit) {
+    Serial.println("[SCAN] acquisition complete; band switch queued until database commit");
+    return;
+  }
+  if (scanState == ScanState::Summary) {
+    scanStateDeadlineMs = millis();
+    return;
+  }
+  scanCancelRequested = true;
+  tft.setTextColor(ST77XX_YELLOW);
+  Message("Cancelling...", 100);
+  Serial.println("[SCAN] cancellation requested");
+}
+
+void normalizeDabScanLabel(const char* source, char destination[17]) {
+  uint8_t first = 0;
+  while (first < 16 && source[first] == ' ') ++first;
+  uint8_t last = 16;
+  while (last > first && (source[last - 1] == ' ' || source[last - 1] == 0)) {
+    --last;
+  }
+  memset(destination, ' ', 16);
+  const uint8_t length = last - first;
+  if (length != 0) {
+    memcpy(destination, source + first, length);
+  } else {
+    memcpy(destination, "unknown?", 8);
+  }
+  destination[16] = 0;
+}
+
+void collectCurrentDabServices() {
+  tft.setTextColor(ST77XX_GREEN);
+  Aff_Scan_Freq(Dab.Ensemble, 65);
+  for (uint8_t i = 0;
+       i < Dab.numberofservices && countSort < MAX_DAB_STATIONS; ++i) {
+    if (Dab.service[i].Type == SERVICE_DATA) continue;
+    char name[17];
+    normalizeDabScanLabel(Dab.service[i].Label, name);
+    addStation(name, scanDabIndex, i, Dab.service[i].ServiceID,
+               Dab.service[i].CompID, Dab.service[i].Charset);
+    tft.setTextColor(ST77XX_WHITE);
+    Aff_Scan_Name(decodeBroadcastText(
+                      reinterpret_cast<const uint8_t*>(name), 16,
+                      Dab.service[i].Charset),
+                  100);
+    Aff_Scan_Service(countSort, 85);
+    const String decodedName = decodeBroadcastText(
+        reinterpret_cast<const uint8_t*>(name), 16,
+        Dab.service[i].Charset);
+    Serial.printf("[SCAN][DAB] %u: freqIndex=%u SID=0x%08lX CID=0x%08lX charset=%u name=%s\n",
+                  countSort, scanDabIndex,
+                  static_cast<unsigned long>(Dab.service[i].ServiceID),
+                  static_cast<unsigned long>(Dab.service[i].CompID),
+                  Dab.service[i].Charset, decodedName.c_str());
+  }
+}
+
+void startScanCommit() {
+  scanCommitIndex = 0;
+  scanState = ScanState::Commit;
+  clearScreen();
+  TFT_aff("Saving stations", 35);
+  Aff_Scan_Service(countSort, 58);
+  drawScanProgress(0);
+  Serial.printf("[SCAN] acquisition complete; committing %u records\n", countSort);
+}
+
+void beginFmRdsPhase() {
+  scanRdsIndex = 0;
+  scanState = ScanState::FmRdsTuneStart;
+  clearScreen();
+  TFT_aff("Reading RDS names", 12);
+  Message("Short SCAN cancels", 32);
+  drawScanProgress(0);
+  Serial.printf("[SCAN][RDS] starting PS detection for %u stations\n", countSort);
+}
+
+void advanceFmRdsStation() {
+  ++scanRdsIndex;
+  if (scanRdsIndex >= countSort) {
+    startScanCommit();
+  } else {
+    scanState = ScanState::FmRdsTuneStart;
+  }
+}
+
+void captureCurrentFmRdsName() {
+  foundChannelFM* station = &channelsFM[scanRdsIndex];
+  normalizeFmPs(Dab.ps, station->name);
+  station->param4 = station->name[0] != 0 && station->name[0] != ' ';
+  if (!station->param4) memcpy(station->name, "unknown?", 9);
+  tft.setTextColor(ST77XX_WHITE);
+  Aff_Scan_Name(decodeRdsText(
+                    reinterpret_cast<const uint8_t*>(station->name), 8),
+                85);
+  Serial.printf("[SCAN][RDS] %u/%u name=%s\n", scanRdsIndex + 1,
+                countSort, station->name);
+}
+
+void completeScanAcquisition() {
+  if (countSort == 0) {
+    clearScreen();
+    TFT_aff("No stations found", 42);
+    Message("Old list preserved", 62);
+    scanState = ScanState::Summary;
+    scanStateDeadlineMs = millis() + 1400;
+    Serial.println("[SCAN] no stations found; old database preserved");
+    return;
+  }
+
+  if (dabMode == 0) {
+    beginFmRdsPhase();
+  } else {
+    startScanCommit();
+  }
+}
+
+void showCancelledScan() {
+  clearScreen();
+  TFT_aff("Scan cancelled", 42);
+  Message("Old list preserved", 62);
+  scanState = ScanState::Summary;
+  scanStateDeadlineMs = millis() + (scanBandSwitchPending ? 0 : 1000);
+  Serial.println("[SCAN] cancelled; old database preserved");
+}
+
+void advanceDabScan() {
+  ++scanDabIndex;
+  if (scanDabIndex >= DAB_FREQS || countSort >= MAX_DAB_STATIONS) {
+    completeScanAcquisition();
+  } else {
+    scanState = ScanState::DabTuneStart;
+  }
+}
+
+void captureCurrentFmStation() {
+  const uint16_t frequency = Dab.freq;
+  if (frequency <= scanLastFmFrequency || countSort >= MAX_FM_STATIONS) return;
+  char name[9] = "unknown?";
+  addStationFM(name, (frequency % 100) / 10, frequency / 100, false);
+  scanLastFmFrequency = frequency;
+  Aff_Scan_Service(countSort, 85);
+  renderFmScanFrequency(frequency);
+  Serial.printf("[SCAN][FM] %u: %u.%02u MHz RSSI=%d SNR=%d\n", countSort,
+                frequency / 100, frequency % 100, Dab.signalstrength, Dab.snr);
+}
+
+bool handleScanRadioResult(RadioOperation operation, bool success) {
+  if (!scanActive()) return false;
+
+  if (operation == RadioOperation::DabTune &&
+      scanState == ScanState::DabTuneWait) {
+    if (scanCancelRequested) {
+      showCancelledScan();
+    } else if (success && Dab.valid) {
+      if (Dab.numberofservices != 0) {
+        collectCurrentDabServices();
+        advanceDabScan();
+      } else {
+        scanState = ScanState::DabServiceListWait;
+        scanStateDeadlineMs = millis() + 4500;
+      }
+    } else {
+      advanceDabScan();
+    }
+    return true;
+  }
+
+  if (operation == RadioOperation::FmTune &&
+      scanState == ScanState::FmTuneWait) {
+    if (scanCancelRequested) {
+      showCancelledScan();
+    } else if (success) {
+      scanLastFmFrequency = Dab.freq;
+      scanState = ScanState::FmSeekStart;
+    } else {
+      completeScanAcquisition();
+    }
+    return true;
+  }
+
+  if (operation == RadioOperation::FmTune &&
+      scanState == ScanState::FmRdsTuneWait) {
+    if (scanCancelRequested) {
+      showCancelledScan();
+    } else if (success && Dab.valid) {
+      scanState = ScanState::FmRdsWait;
+      scanStateDeadlineMs = millis() + 8000;
+    } else {
+      Serial.printf("[SCAN][RDS] %u/%u tune failed; keeping unknown name\n",
+                    scanRdsIndex + 1, countSort);
+      advanceFmRdsStation();
+    }
+    return true;
+  }
+
+  if (operation == RadioOperation::FmSeek &&
+      scanState == ScanState::FmSeekWait) {
+    if (scanCancelRequested) {
+      showCancelledScan();
+    } else if (success && Dab.valid && Dab.freq > scanLastFmFrequency &&
+               Dab.freq <= 10790) {
+      captureCurrentFmStation();
+      if (Dab.freq >= 10790 || countSort >= MAX_FM_STATIONS) {
+        completeScanAcquisition();
+      } else {
+        scanState = ScanState::FmSeekStart;
+      }
+    } else {
+      completeScanAcquisition();
+    }
+    return true;
+  }
+  return false;
+}
+
+void commitNextScanRecord() {
+  if (scanCommitIndex < countSort) {
+    if (dabMode == 1) {
+      foundChannel* station = &channels[scanCommitIndex];
+      saveDABchannelToEEPROM(scanCommitIndex + 1, station->param1,
+                              station->param2, station->param3,
+                              station->param4, station->name,
+                              station->charset);
+    } else {
+      foundChannelFM* station = &channelsFM[scanCommitIndex];
+      saveFMchannelToEEPROM(scanCommitIndex + 1, station->param2,
+                            station->param3, station->param4, station->name);
+    }
+    ++scanCommitIndex;
+    drawScanProgress(static_cast<uint8_t>(
+        static_cast<uint16_t>(scanCommitIndex) * 100U / countSort));
+    return;
+  }
+
+  if (dabMode == 1) {
+    totalDABchannels = countSort;
+    currentDABchannel = 1;
+    for (uint8_t i = 0; i < countSort; ++i) {
+      if (channels[i].param3 == scanPreviousDabServiceId &&
+          channels[i].param4 == scanPreviousDabComponentId) {
+        currentDABchannel = i + 1;
+        break;
+      }
+    }
+    saveTotalDABchannelToEEPROM(totalDABchannels);
+    saveCurrentDABChannelToEEPROM(currentDABchannel);
+  } else {
+    totalFMchannels = countSort;
+    currentFMchannel = 1;
+    for (uint8_t i = 0; i < countSort; ++i) {
+      const uint16_t frequency =
+          100U * channelsFM[i].param3 + 10U * channelsFM[i].param2;
+      if (frequency == scanPreviousFmFrequency) {
+        currentFMchannel = i + 1;
+        break;
+      }
+    }
+    saveTotalFMchannelToEEPROM(totalFMchannels);
+    saveCurrentFMchannelToEEPROM(currentFMchannel);
+  }
+
+  clearScreen();
+  TFT_aff("Scan complete", 42);
+  Aff_Scan_Service(countSort, 62);
+  scanState = ScanState::Summary;
+  scanStateDeadlineMs = millis() + (scanBandSwitchPending ? 0 : 1400);
+  Serial.printf("[SCAN] database commit complete: %u stations\n", countSort);
+}
+
+void finishScanSession() {
+  const bool switchBand = scanBandSwitchPending;
+  scanState = ScanState::Idle;
+  scanCancelRequested = false;
+  scanBandSwitchPending = false;
+  Dab.requestVolume(vol);
+
+  if (switchBand) {
+    dabMode = !dabMode;
+    saveModeToEEPROM(dabMode);
+    clearScreen();
+    TFT_aff(dabMode == 1 ? "Starting DAB" : "Starting FM", 40);
+    Dab.beginAsync(dabMode == 1 ? 0 : 1);
+    return;
+  }
+
+  clearScreen();
+  if (dabMode == 1) {
+    if (totalDABchannels != 0) {
+      DAB_SetChannel();
+    } else {
+      TFT_aff("Please Scan!", 50);
+    }
+  } else if (totalFMchannels != 0) {
+    FMsetChannel(currentFMchannel, true);
+  } else {
+    TFT_aff("Please Scan!", 50);
+  }
+}
+
+void serviceScan(uint32_t now) {
+  if (!scanActive()) return;
+
+  if (scanCancelRequested && Dab.ready() &&
+      scanState != ScanState::Commit && scanState != ScanState::Summary) {
+    showCancelledScan();
+    return;
+  }
+
+  switch (scanState) {
+    case ScanState::MuteWait:
+      if (static_cast<int32_t>(now - scanStateDeadlineMs) >= 0 && Dab.ready()) {
+        scanState = dabMode == 1 ? ScanState::DabTuneStart
+                                 : ScanState::FmTuneStart;
+      }
+      break;
+
+    case ScanState::DabTuneStart:
+      renderDabScanFrequency();
+      if (Dab.requestDabTune(scanDabIndex)) {
+        scanState = ScanState::DabTuneWait;
+      }
+      break;
+
+    case ScanState::DabServiceListWait:
+      if (Dab.numberofservices != 0) {
+        collectCurrentDabServices();
+        advanceDabScan();
+      } else if (static_cast<int32_t>(now - scanStateDeadlineMs) >= 0) {
+        Serial.printf("[SCAN][DAB] service-list timeout at index=%u\n",
+                      scanDabIndex);
+        advanceDabScan();
+      }
+      break;
+
+    case ScanState::FmTuneStart:
+      renderFmScanFrequency(8750);
+      if (Dab.requestFmTune(8750)) scanState = ScanState::FmTuneWait;
+      break;
+
+    case ScanState::FmSeekStart:
+      if (Dab.requestFmSeek(true, false)) scanState = ScanState::FmSeekWait;
+      break;
+
+    case ScanState::FmRdsTuneStart: {
+      foundChannelFM* station = &channelsFM[scanRdsIndex];
+      const uint16_t frequency =
+          100U * station->param3 + 10U * station->param2;
+      char statusText[24];
+      renderFmScanFrequency(frequency);
+      snprintf(statusText, sizeof(statusText), "RDS %u/%u",
+               scanRdsIndex + 1, countSort);
+      tft.setTextColor(ST77XX_YELLOW);
+      Aff_Scan_Freq(statusText, 70);
+      Aff_Scan_Name("Čekám na RDS...", 85);
+      drawScanProgress(static_cast<uint8_t>(
+          static_cast<uint16_t>(scanRdsIndex) * 100U / countSort));
+      if (Dab.requestFmTune(frequency)) {
+        scanState = ScanState::FmRdsTuneWait;
+      }
       break;
     }
-  }
-  saveTotalFMchannelToEEPROM(totalFMchannels);                                                 // end of scan 
-  Serial.println();
-  clearScreen();
 
-  if (totalFMchannels != 0) {
-      TFT_aff("Search RDS...", 20);
-      countSort = 0;                                                                           // 2nd step : looking for a valid RDS name - update EEPROM with the valid RDS or leave unknown? if not found
-      for (i = 1 ; i<= totalFMchannels; i++){        
-         lastRDS = millis();
-         flagTimeout = 0;                                                                      // reset flag                      
-         FMsetChannel(i , 0);                                                                  // select FM channel and doesn't update name on display
-         FMreadEEPROM(i);                                                                      // read info from EEPROM
-         do {
-              Dab.task();
-              m = strlen(Dab.ps);
-              if (! digitalRead(scan_sw)){                                                     // read keyboord (scan)
-                 i = totalFMchannels;                                                          // force la sortie
-                 flagTimeout = 1;                                                              // emulates Timeout
-                 clearScreen();                                                                // clear screen
-                 delay(scanDelay);                                                             // wait for end of scan
-                 break;
-              }
-              if((millis()-lastRDS) > timeOut){
-                flagTimeout = 1;
-              }         
-         } while ((m == 0) && !flagTimeout ) ;                                                 // wait for a valid RDS name or scan key pressed or timeOut=1  
-              
-         if (!flagTimeout) {                                                                   // timeOut then next station
-             flag_name_FM = 1;
-             for(j = 0; j < 8; j++) {                                                          // blank newName
-                newFMname[j] = ' ';
-             }
-             newFMname[8] = 0;                                                                 // terminator
-             j = 0;                                                                            // name can be "   FIP    " or "FIP     " or "      FIP"....
-             bool flag = 0;
-             for (k = 0; k <8; k++) {
-                if ( (Dab.ps[k] != ' ') && (flag == 0) ){
-                   flag = 1;
-                }
-                if (flag == 1) {
-                   newFMname[j] = Dab.ps[k];                                                   // left justify RDS name
-                   j++;
-                }
-             }
-             m = strlen(newFMname);                                                            // right fill DAB name with blanks
-             if (m < 8){
-                for (j = m; j<8; j++){
-                   newFMname[j] = ' ';
-                }
-                newFMname[8] = 0;                                                              // terminator
-             }
-        
-             FM_name(newFMname, 52);                                                           // displays FM name 
-             Serial.print(i);                                                                  // RDS name found or timeout or force exit
-             Serial.print(">\t");
-             Serial.print("RDS name: " + String(Dab.ps));        
-             Serial.println("\tNew Name: "+ String(newFMname));     
-             addStationFM(newFMname,currentFMchannel, stationFM_l, stationFM_h, flag_name_FM); //save data with formated RDS name                                       
-         }else{
-             Serial.print(i);                                                                  // RDS name found or timeout or force exit
-             Serial.print(">\ttimeout : ");
-             FM_name(fmName, 52);                                                              // displays FM name  
-             Serial.println(fmName);
-             addStationFM(fmName,currentFMchannel, stationFM_l, stationFM_h, flag_name_FM);    // no change       
-         }
+    case ScanState::FmRdsWait:
+      if (strlen(Dab.ps) != 0) {
+        captureCurrentFmRdsName();
+        advanceFmRdsStation();
+      } else if (static_cast<int32_t>(now - scanStateDeadlineMs) >= 0) {
+        Aff_Scan_Name("unknown?", 85);
+        Serial.printf("[SCAN][RDS] %u/%u timeout; keeping unknown name\n",
+                      scanRdsIndex + 1, countSort);
+        advanceFmRdsStation();
       }
-      clearScreen();
-      TFT_aff("Channels", 8);
-      TFT_aff("Sorting ...", 40); 
-      sortNewFMlist();                                                                         // RDS name list has changed so sort it   
-      listStations(after);
-      currentFMchannel = 1;                                                                    // we use the first available service
-      saveCurrentFMchannelToEEPROM(currentFMchannel);  
-      clearScreen();
-      FMsetChannel(currentFMchannel, 1);                                                       // select currentFMchannel and displays name 
-    }else{
-      clearScreen();
-      TFT_aff("No channel !",55);
-      currentFMchannel = 0;                                                                    // we use the first available service
-      saveCurrentFMchannelToEEPROM(currentFMchannel); 
-    }
-}          
+      break;
+
+    case ScanState::Commit:
+      commitNextScanRecord();
+      break;
+
+    case ScanState::Summary:
+      if (static_cast<int32_t>(now - scanStateDeadlineMs) >= 0) {
+        finishScanSession();
+      }
+      break;
+
+    default:
+      break;
+  }
+}
 
 void DAB_SetChannel(void)
 {
   DABreadEEPROM(currentDABchannel);
-  TFT_aff(dabName, 8);                          // display DAB name
-  DAB_affNum();                                 // display currentChannel/totalDABchannelss
-  Volume();                                     // display volume set
-  Dab.vol(vol);                                 // set volume
-  Dab.tuneservice(ensemble, serviceid, compid);
-  Serial.printf("DAB channel: %d  ", currentDABchannel);
-  Serial.printf("DAB name: %s\n", dabName);
+  uiBroadcastText = "";
+  if (uiView == UiView::Tech && uiSettings.techEnabled) renderTechScreen();
+  else renderListeningScreen();
+  Dab.requestVolume(vol);
+  if (!Dab.requestDabService(ensemble, serviceid, compid)) {
+    Serial.println("[APP][WARN] DAB tune request rejected while radio is busy");
+  }
+  const String decodedName = decodeBroadcastText(
+      reinterpret_cast<const uint8_t*>(dabName), 16, dabCharset);
+  Serial.printf("DAB channel: %d  DAB name: %s  charset=%u (%s)\n",
+                currentDABchannel, decodedName.c_str(), dabCharset,
+                broadcastCharsetName(dabCharset));
   //Serial.printf("ensemble: %d", ensemble);    // debug
   //Serial.printf("\tservice: %d", service);
   //Serial.printf("\tserviceid: %d", serviceid);
@@ -804,91 +1255,41 @@ void DAB_SetChannel(void)
 void FMsetChannel(uint8_t FMchannel, bool flag)
 {
   FMreadEEPROM(FMchannel);
-  if (flag) FM_name(fmName, 8);                 // display FM name
-  FM_affNum();                                  // display channel number/total channels
-  Volume();                                     // display volume set
-  Dab.vol(vol);                                 // set volume
+  flag_sel = flag;
+  uiBroadcastText = "";
+  if (uiView == UiView::Tech && uiSettings.techEnabled) renderTechScreen();
+  else renderListeningScreen();
+  Dab.requestVolume(vol);
   stationFM = 100*stationFM_h + stationFM_l*10;
-  Dab.tune(stationFM);
+  if (!Dab.requestFmTune(stationFM)) {
+    Serial.println("[APP][WARN] FM tune request rejected while radio is busy");
+  }
   Serial.printf("FM channel: %d  ", FMchannel);
   Serial.printf("FM name: %s", fmName);
   Serial.printf("\tfrequency: %3d.%1d MHz\n",stationFM_h,stationFM_l);
 }
 
-void sortNewFMlist(void)
-{
-uint8_t i;
-char charName[9];
-  sortStationsFM();
-  for (i = 1; i <= totalFMchannels; i++)
-  {
-    foundChannelFM *s = &channelsFM[i-1];
-    for (int j=0; j < 8; j++){
-      charName[j] = s->name[j];                                             // RDS name has only 8 characters
-    }
-    charName[8] = 0;                                                        // terminator
-    saveFMchannelToEEPROM(i, s->param2, s->param3, s->param4, charName);    // save to EEPROM after sorting
-  }
-}
-
-void sortFMchannels(void)
-{
-uint8_t i;
-char charName[9];
-countSort = 0;
-for (i=0 ; i < totalFMchannels ; i++){
-  FMreadEEPROM(i+1);
-  countSort = i;
-  addStationFM(fmName,currentFMchannel, stationFM_l, stationFM_h, flag_name_FM);
-}
-  sortStationsFM();
-  for (i = 1; i <= totalFMchannels; i++)
-  {
-    foundChannelFM *s = &channelsFM[i-1];
-     for (int j=0; j < 8; j++){
-      charName[j] = s->name[j]; //RDS name has only 8 characters
-    }
-    charName[8] = 0;                                                        // terminator
-    saveFMchannelToEEPROM(i, s->param2, s->param3, s->param4, charName);    // save to EEPROM after sorting
-  }
-}
-
-void addStation(char * name, uint8_t param1, uint8_t param2, uint32_t param3, uint32_t param4, bool param5) {
-    uint8_t len = strlen(name);
+void addStation(char * name, uint8_t param1, uint8_t param2, uint32_t param3,
+                uint32_t param4, uint8_t charset) {
+    if (countSort >= MAX_DAB_STATIONS) return;
     foundChannel *s   = &channels[countSort];
-    strncpy(s->name, name, len < foundChannel::NAME_MAX_LEN ? len : foundChannel::NAME_MAX_LEN);
+    memset(s->name, 0, sizeof(s->name));
+    memcpy(s->name, name, foundChannel::NAME_MAX_LEN);
     s->param1 = param1;
     s->param2 = param2;
     s->param3 = param3;
     s->param4 = param4;
-    s->param5 = param5;
+    s->charset = charset;
     countSort++;
 }
 
-void addStationFM(char * name, uint8_t param1, uint8_t param2, uint8_t param3, bool param4) {
-    uint8_t len = strlen(name);
+void addStationFM(char * name, uint8_t param2, uint8_t param3, bool param4) {
+    if (countSort >= MAX_FM_STATIONS) return;
     foundChannelFM *s   = &channelsFM[countSort];
-    strncpy(s->name, name, len < foundChannelFM::NAME_MAX_LEN ? len : foundChannelFM::NAME_MAX_LEN);
-    s->param1 = param1;
+    memset(s->name, 0, sizeof(s->name));
+    memcpy(s->name, name, foundChannelFM::NAME_MAX_LEN);
     s->param2 = param2;
     s->param3 = param3;
     s->param4 = param4;
     countSort++;
-}
-
-void sortStations(void) {
-    qsort(channels, countSort, sizeof(foundChannel), foundChannel::compareByName);
-}
-
-void sortStationsFM(void) {
-    qsort(channelsFM, countSort, sizeof(foundChannelFM), foundChannelFM::compareByName);
-}
-
-void DABSpiMsg(unsigned char *data, uint32_t len)
-{
-  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));    //2MHz for starters...
-  digitalWrite (slaveSelectPin, LOW);
-  SPI.transfer(data, len);
-  digitalWrite (slaveSelectPin, HIGH);
-  SPI.endTransaction();
 }

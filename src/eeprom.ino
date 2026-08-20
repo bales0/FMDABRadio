@@ -1,6 +1,48 @@
 // ------ EEPROM -------------
 // 
 
+constexpr byte ADDR_SETTINGS_MAGIC_0 = 6;
+constexpr byte ADDR_SETTINGS_MAGIC_1 = 7;
+constexpr byte ADDR_SETTINGS_SCHEMA = 8;
+constexpr byte ADDR_SETTINGS_MARKER = 9;
+constexpr byte SETTINGS_MAGIC_0 = 0x46;  // 'F'
+constexpr byte SETTINGS_MAGIC_1 = 0x52;  // 'R'
+constexpr byte SETTINGS_SCHEMA = 2;
+constexpr byte SETTINGS_MARKER = 0xA5;
+constexpr uint32_t SETTINGS_COMMIT_DELAY_MS = 5000;
+
+enum SettingsDirty : uint8_t {
+  DIRTY_VOLUME = 1U << 0,
+  DIRTY_MODE = 1U << 1,
+  DIRTY_DAB_CHANNEL = 1U << 2,
+  DIRTY_FM_CHANNEL = 1U << 3,
+  DIRTY_UI = 1U << 4
+};
+
+uint8_t settingsDirty = 0;
+uint32_t settingsChangedAtMs = 0;
+byte persistedVolume = 0;
+byte persistedMode = 0;
+byte persistedDabChannel = 0;
+byte persistedFmChannel = 0;
+byte pendingVolume = 0;
+byte pendingMode = 0;
+byte pendingDabChannel = 0;
+byte pendingFmChannel = 0;
+UiSettings persistedUiSettings;
+UiSettings pendingUiSettings;
+
+void markSettingsDirty(uint8_t flag) {
+  settingsDirty |= flag;
+  settingsChangedAtMs = millis();
+}
+
+void writeSettingsSchema() {
+  extEEPROM.put(ADDR_SETTINGS_MAGIC_0, SETTINGS_MAGIC_0);
+  extEEPROM.put(ADDR_SETTINGS_MAGIC_1, SETTINGS_MAGIC_1);
+  extEEPROM.put(ADDR_SETTINGS_SCHEMA, SETTINGS_SCHEMA);
+  extEEPROM.put(ADDR_SETTINGS_MARKER, SETTINGS_MARKER);
+}
 void startEEPROM(){
    Wire.begin();
    Wire.setClock(400000);
@@ -23,30 +65,32 @@ void cleanEEPROM() {
   TFT_aff("Init EEPROM", 50);
   extEEPROM.erase();
   
-  saveVolumeToEEPROM(45);
-  saveModeToEEPROM(0);                                          // FM mode
-  saveCurrentFMchannelToEEPROM(1);   
-  saveTotalFMchannelToEEPROM(0);
-  saveCurrentDABChannelToEEPROM(1);
-  saveTotalDABchannelToEEPROM(0);  
+  const byte factoryVolume = 57;
+  const byte factoryMode = 0;
+  const byte factoryChannel = 1;
+  const byte factoryTotal = 0;
+  extEEPROM.put(ADDR_VOLUME, factoryVolume);
+  extEEPROM.put(ADDR_MODE, factoryMode);                         // FM mode
+  extEEPROM.put(ADDR_CURRENT_FM_CHANNEL, factoryChannel);
+  extEEPROM.put(ADDR_TOTAL_FM_CHANNEL, factoryTotal);
+  extEEPROM.put(ADDR_CURRENT_DAB_CHANNEL, factoryChannel);
+  extEEPROM.put(ADDR_TOTAL_DAB_CHANNEL, factoryTotal);
+  writeSettingsSchema();
+  persistedVolume = pendingVolume = factoryVolume;
+  persistedMode = pendingMode = factoryMode;
+  persistedFmChannel = pendingFmChannel = factoryChannel;
+  persistedDabChannel = pendingDabChannel = factoryChannel;
+  settingsDirty = 0;
   for (i=1; i <= MAX_FM_STATIONS; i++)                          // Clear FM infos
   {
      saveFMchannelToEEPROM(i, (stationFM%100)/10, stationFM/100, 0, FMNAME);
   }   
   for ( i=1; i <= MAX_DAB_STATIONS; i++)                        // Clear DAB infos
   {
-     saveDABchannelToEEPROM(i, 0, 0, 0, 0, DABNAME);
+     saveDABchannelToEEPROM(i, 0, 0, 0, 0, DABNAME, 0);
   }    
   clearScreen();
   TFT_aff("Release sel", 50);    
-}
-
-void cleanChannels(byte number) {
-  countSort = 0;
-  char empty[17]="                ";
-  for ( byte i; i<number; i++){
-     addStation(empty, 0, 0, 0, 0, 0);
-  }   
 }
 
 void lastEEPROM(){                                               // read back : vol, dabMode, currentDABchannel, totalDABchannels
@@ -56,7 +100,65 @@ void lastEEPROM(){                                               // read back : 
     extEEPROM.get(ADDR_TOTAL_DAB_CHANNEL, totalDABchannels);
     extEEPROM.get(ADDR_CURRENT_FM_CHANNEL, currentFMchannel);  
     extEEPROM.get(ADDR_TOTAL_FM_CHANNEL, totalFMchannels); 
-    //Serial.println("-> Read vol, dabMode, current channel, total channel, from EEPROM");   
+
+    byte magic0, magic1, schema, marker;
+    extEEPROM.get(ADDR_SETTINGS_MAGIC_0, magic0);
+    extEEPROM.get(ADDR_SETTINGS_MAGIC_1, magic1);
+    extEEPROM.get(ADDR_SETTINGS_SCHEMA, schema);
+    extEEPROM.get(ADDR_SETTINGS_MARKER, marker);
+    const bool currentSchema = magic0 == SETTINGS_MAGIC_0 &&
+                               magic1 == SETTINGS_MAGIC_1 &&
+                               schema == SETTINGS_SCHEMA &&
+                               marker == SETTINGS_MARKER;
+    if (!currentSchema) {
+      const byte legacyVolume = vol;
+      if (legacyVolume == 0) {
+        vol = 0;
+      } else if (legacyVolume <= 63) {
+        vol = legacyVolume + 12;
+      } else {
+        vol = 57;
+      }
+      // Bytes 10 and above contain the station tables and are deliberately
+      // untouched by this one-time settings migration.
+      extEEPROM.put(ADDR_VOLUME, vol);
+      writeSettingsSchema();
+      Serial.printf("[EEPROM] migrated volume %u -> V%u; station tables preserved\n",
+                    legacyVolume, vol);
+    }
+
+    persistedVolume = pendingVolume = vol;
+    persistedMode = pendingMode = dabMode;
+    persistedDabChannel = pendingDabChannel = currentDABchannel;
+    persistedFmChannel = pendingFmChannel = currentFMchannel;
+    settingsDirty = 0;
+}
+
+void loadUiSettings() {
+  constexpr uint8_t recordSize = 11;
+  uint8_t record[recordSize] = {0};
+  extEEPROM.read(EEPROM_SIZE, record, sizeof(record));
+  const bool validV1 = record[0] == 'U' && record[1] == 'I' &&
+                       record[2] == 1 && record[8] == 0xA5;
+  const bool validV2 = record[0] == 'U' && record[1] == 'I' &&
+                       record[2] == 2 && record[10] == 0xA5;
+  if (validV1 || validV2) {
+    uiSettings.brightness = constrain(record[3], 20, 100);
+    uiSettings.dimLevel = constrain(record[4], 5, uiSettings.brightness);
+    uiSettings.dimTimeoutIndex = record[5] <= 3 ? record[5] : 1;
+    uiSettings.techEnabled = record[6] ? 1 : 0;
+    uiSettings.defaultView = record[7] <= 2 ? record[7] : 0;
+    if (validV2) {
+      uiSettings.slideshowMode = record[8] <= 2 ? record[8] : 1;
+      uiSettings.slideshowLayout = record[9] ? 1 : 0;
+    }
+  }
+  persistedUiSettings = pendingUiSettings = uiSettings;
+}
+
+void saveUiSettingsDelayed() {
+  pendingUiSettings = uiSettings;
+  markSettingsDirty(DIRTY_UI);
 }
 
 void DABreadEEPROM(byte channel){
@@ -65,7 +167,10 @@ void DABreadEEPROM(byte channel){
     extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 2, service);
     extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 3, serviceid);
     extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 7, compid);
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 11, dabName);
+    extEEPROM.read(ADDR_DAB_CHANNEL + 28*(channel-1) + 11,
+                   reinterpret_cast<uint8_t*>(dabName), 16);
+    dabName[16] = 0;
+    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 27, dabCharset);
     //Serial.println("-> Read current channel, ensemble, service, serviceid, compid, dabName, from EEPROM");   
 }
 
@@ -81,82 +186,131 @@ void FMreadEEPROM(byte channel){
 // Last volume backup
 // ------------------------
 void saveVolumeToEEPROM(byte volume){
-    extEEPROM.put(ADDR_VOLUME, volume);
-    //Serial.println("-> volume has been stored in EEPROM");
+    pendingVolume = volume;
+    markSettingsDirty(DIRTY_VOLUME);
 }
 
 // Save mode (DAB/FM)
 // ------------------------
 void saveModeToEEPROM(byte dabMode){
-    extEEPROM.put(ADDR_MODE, dabMode);
-    //Serial.println("-> mode has been stored in EEPROM");
+    pendingMode = dabMode;
+    markSettingsDirty(DIRTY_MODE);
 }
 
 // Save DAB total channels
 // ------------------------
 void saveTotalDABchannelToEEPROM(byte total){
-    extEEPROM.put(ADDR_TOTAL_DAB_CHANNEL, total);
-    //Serial.println("-> Total Channels has been stored in EEPROM");
+    byte stored;
+    extEEPROM.get(ADDR_TOTAL_DAB_CHANNEL, stored);
+    if (stored != total) extEEPROM.put(ADDR_TOTAL_DAB_CHANNEL, total);
 }
 
 // Save FM total channels
 // ------------------------
 void saveTotalFMchannelToEEPROM(byte total){
-    extEEPROM.put(ADDR_TOTAL_FM_CHANNEL, total);
-    //Serial.println("-> Total Channels has been stored in EEPROM");
+    byte stored;
+    extEEPROM.get(ADDR_TOTAL_FM_CHANNEL, stored);
+    if (stored != total) extEEPROM.put(ADDR_TOTAL_FM_CHANNEL, total);
 }
 
 // Save FM Current channel
 // ------------------------
 void saveCurrentFMchannelToEEPROM(byte current){
-    extEEPROM.put(ADDR_CURRENT_FM_CHANNEL, current);
-    //Serial.println("-> Current channel has been stored in EEPROM");
+    pendingFmChannel = current;
+    markSettingsDirty(DIRTY_FM_CHANNEL);
 }
 
 // Save DAB Current channel
 // ------------------------
 void saveCurrentDABChannelToEEPROM(byte current){
-    extEEPROM.put(ADDR_CURRENT_DAB_CHANNEL, current);
-    //Serial.println("-> Current channel has been stored in EEPROM");
+    pendingDabChannel = current;
+    markSettingsDirty(DIRTY_DAB_CHANNEL);
+}
+
+void commitDirtySettingsIfDue() {
+  if (settingsDirty == 0 ||
+      static_cast<uint32_t>(millis() - settingsChangedAtMs) <
+          SETTINGS_COMMIT_DELAY_MS) {
+    return;
+  }
+
+  uint8_t written = 0;
+  if ((settingsDirty & DIRTY_VOLUME) && pendingVolume != persistedVolume) {
+    extEEPROM.put(ADDR_VOLUME, pendingVolume);
+    persistedVolume = pendingVolume;
+    ++written;
+  }
+  if ((settingsDirty & DIRTY_MODE) && pendingMode != persistedMode) {
+    extEEPROM.put(ADDR_MODE, pendingMode);
+    persistedMode = pendingMode;
+    ++written;
+  }
+  if ((settingsDirty & DIRTY_DAB_CHANNEL) &&
+      pendingDabChannel != persistedDabChannel) {
+    extEEPROM.put(ADDR_CURRENT_DAB_CHANNEL, pendingDabChannel);
+    persistedDabChannel = pendingDabChannel;
+    ++written;
+  }
+  if ((settingsDirty & DIRTY_FM_CHANNEL) &&
+      pendingFmChannel != persistedFmChannel) {
+    extEEPROM.put(ADDR_CURRENT_FM_CHANNEL, pendingFmChannel);
+    persistedFmChannel = pendingFmChannel;
+    ++written;
+  }
+  if ((settingsDirty & DIRTY_UI) &&
+      memcmp(&pendingUiSettings, &persistedUiSettings,
+             sizeof(UiSettings)) != 0) {
+    uint8_t record[11] = {
+        'U', 'I', 2,
+        pendingUiSettings.brightness,
+        pendingUiSettings.dimLevel,
+        pendingUiSettings.dimTimeoutIndex,
+        pendingUiSettings.techEnabled,
+        pendingUiSettings.defaultView,
+        pendingUiSettings.slideshowMode,
+        pendingUiSettings.slideshowLayout,
+        0xA5};
+    extEEPROM.write(EEPROM_SIZE, record, sizeof(record));
+    persistedUiSettings = pendingUiSettings;
+    written += sizeof(record);
+  }
+  settingsDirty = 0;
+  Serial.printf("[EEPROM] settings committed after 5 s (%u byte%s written)\n",
+                written, written == 1 ? "" : "s");
 }
 
 // Save channel number , ensemble, service
-void saveDABchannelToEEPROM(byte channel, byte ensemble, byte service, uint32_t serviceid, uint32_t compid, char charName[17]){ 
-    extEEPROM.put(ADDR_DAB_CHANNEL + 28*(channel-1), channel);
-    extEEPROM.put(ADDR_DAB_CHANNEL  + 28*(channel-1)+1, ensemble);
-    extEEPROM.put(ADDR_DAB_CHANNEL  + 28*(channel-1)+ 2, service);
-    extEEPROM.put(ADDR_DAB_CHANNEL  + 28*(channel-1)+ 3, serviceid);
-    extEEPROM.put(ADDR_DAB_CHANNEL  + 28*(channel-1)+ 7, compid);
-    for (int i=0; i < 16; i++){
-      extEEPROM.put(ADDR_DAB_CHANNEL  + 28*(channel-1)+ 11+i, charName[i]);
-    }
-    charName[16] = 0;  //terminator
-    extEEPROM.put(ADDR_DAB_CHANNEL  + 28*(channel-1)+ 11 + 16, charName[16]);
-    //Serial.print("-> Channel has been stored in EEPROM");
+void saveDABchannelToEEPROM(byte channel, byte ensemble, byte service,
+                            uint32_t serviceid, uint32_t compid,
+                            char charName[17], byte charset){
+    uint8_t record[28] = {0};
+    record[0] = channel;
+    record[1] = ensemble;
+    record[2] = service;
+    memcpy(record + 3, &serviceid, sizeof(serviceid));
+    memcpy(record + 7, &compid, sizeof(compid));
+    memcpy(record + 11, charName, 16);
+    record[27] = charset;
+    extEEPROM.write(ADDR_DAB_CHANNEL + 28*(channel-1), record, sizeof(record));
 }
 
 
 // Save channel number , ensemble, service
 void saveFMchannelToEEPROM(byte channel, byte stationFM_l, byte stationFM_h, bool flagDisplay, char charName[9]){ 
-    extEEPROM.put(ADDR_FM_CHANNEL + 13*(channel-1), channel);
-    extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 1, stationFM_l);
-    extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 2, stationFM_h);
-    extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 3, flagDisplay);
-    for (int i=0; i < 8; i++){
-      extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 4 + i, charName[i]);
-    }
-    charName[8] = 0;  //terminator
-    extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 4 + 8, charName[8]);
-    //Serial.println("-> Channel has been stored in EEPROM");
+    uint8_t record[13] = {0};
+    record[0] = channel;
+    record[1] = stationFM_l;
+    record[2] = stationFM_h;
+    record[3] = flagDisplay ? 1 : 0;
+    memcpy(record + 4, charName, 8);
+    extEEPROM.write(ADDR_FM_CHANNEL + 13*(channel-1), record, sizeof(record));
 }
 
 // Save flagDisplayName_RDS and RDS name
 void saveFMnameToEEPROM(byte channel, bool flagDisplay, char charName[9]){
-    extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 3, flagDisplay);
-    for (int i=0; i < 8; i++){
-      extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 4 + i, charName[i]);
-    }
-    charName[8] = 0;  //terminator
-    extEEPROM.put(ADDR_FM_CHANNEL  + 13*(channel-1)+ 4 + 8, charName[8]);
-    //Serial.println("-> FlagDisplay and RDS name have been stored in EEPROM");
+    uint8_t record[10] = {0};
+    record[0] = flagDisplay ? 1 : 0;
+    memcpy(record + 1, charName, 8);
+    extEEPROM.write(ADDR_FM_CHANNEL + 13*(channel-1) + 3,
+                    record, sizeof(record));
 }
