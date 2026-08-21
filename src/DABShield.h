@@ -65,6 +65,8 @@ class DAB {
 
   void configurePins(uint8_t chipSelect, uint8_t interrupt, uint8_t reset, uint8_t powerEnable);
   void configureAudioPins(uint8_t gain0, uint8_t gain1);
+  void configureFmBand(uint16_t bottom10kHz, uint16_t top10kHz,
+                       uint8_t spacing10kHz, uint8_t deEmphasis);
   void setDiagnostics(Stream* stream);
   void setCallback(void (*serviceDataCallback)(void));
   bool setSlideshowEnabled(bool enabled);
@@ -268,6 +270,10 @@ class DAB {
   uint32_t _operationDeadlineMs;
   uint32_t _patchOffset;
   uint16_t _fmTuneTarget;
+  uint16_t _fmBandBottom;
+  uint16_t _fmBandTop;
+  uint8_t _fmSeekSpacing;
+  uint8_t _fmDeEmphasis;
   uint8_t _dabTuneTarget;
   uint32_t _serviceId;
   uint32_t _componentId;
@@ -289,7 +295,10 @@ class DAB {
 
   static constexpr uint8_t SLS_MAX_SEGMENTS = 96;
   static constexpr uint16_t SLS_SEGMENT_SLOT_BYTES = 512;
-  uint8_t* _slideshowArena;
+  // Fixed for the lifetime of the application. Keeping the compressed MOT
+  // object out of the heap prevents a 48 KiB allocation/free cycle whenever
+  // slideshow mode is changed.
+  alignas(4) uint8_t _slideshowArena[DAB_SLS_ARENA_BYTES];
   uint16_t _slideshowSegmentLengths[SLS_MAX_SEGMENTS];
   uint8_t _slideshowSegmentBitmap[(SLS_MAX_SEGMENTS + 7) / 8];
   uint32_t _slideshowTransportId;

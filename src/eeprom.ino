@@ -10,6 +10,9 @@ constexpr byte SETTINGS_MAGIC_1 = 0x52;  // 'R'
 constexpr byte SETTINGS_SCHEMA = 2;
 constexpr byte SETTINGS_MARKER = 0xA5;
 constexpr uint32_t SETTINGS_COMMIT_DELAY_MS = 5000;
+constexpr int ADDR_FM_DATABASE_MAGIC = EEPROM_SIZE + 12;
+constexpr int ADDR_FM_DATABASE_REGION = EEPROM_SIZE + 13;
+constexpr byte FM_DATABASE_MAGIC = 0xB7;
 
 enum SettingsDirty : uint8_t {
   DIRTY_VOLUME = 1U << 0,
@@ -46,10 +49,12 @@ void writeSettingsSchema() {
 void startEEPROM(){
    Wire.begin();
    Wire.setClock(400000);
+   Wire.setTimeOut(50);
    if (extEEPROM.begin() == false) 
   {
     Message_red("No memory detected",97);
-    while (1);// freezing !
+    Serial.println("[EEPROM][FATAL] external EEPROM not detected; radio halted");
+    while (true) delay(1000);
   }
   extEEPROM.setMemorySize(256000 / 8); //EEPROM is the 24256C (256k bit)
   Serial.print("Mem size in bytes: ");
@@ -76,6 +81,10 @@ void cleanEEPROM() {
   extEEPROM.put(ADDR_CURRENT_DAB_CHANNEL, factoryChannel);
   extEEPROM.put(ADDR_TOTAL_DAB_CHANNEL, factoryTotal);
   writeSettingsSchema();
+  extEEPROM.put(ADDR_FM_DATABASE_MAGIC, FM_DATABASE_MAGIC);
+  extEEPROM.put(ADDR_FM_DATABASE_REGION,
+                static_cast<byte>(FmRegion::Europe));
+  fmDatabaseRegion = static_cast<byte>(FmRegion::Europe);
   persistedVolume = pendingVolume = factoryVolume;
   persistedMode = pendingMode = factoryMode;
   persistedFmChannel = pendingFmChannel = factoryChannel;
@@ -100,6 +109,25 @@ void lastEEPROM(){                                               // read back : 
     extEEPROM.get(ADDR_TOTAL_DAB_CHANNEL, totalDABchannels);
     extEEPROM.get(ADDR_CURRENT_FM_CHANNEL, currentFMchannel);  
     extEEPROM.get(ADDR_TOTAL_FM_CHANNEL, totalFMchannels); 
+
+    if (totalDABchannels > MAX_DAB_STATIONS) {
+      Serial.printf("[EEPROM][WARN] invalid DAB station count %u; list disabled\n",
+                    totalDABchannels);
+      totalDABchannels = 0;
+    }
+    if (totalFMchannels > MAX_FM_STATIONS) {
+      Serial.printf("[EEPROM][WARN] invalid FM station count %u; list disabled\n",
+                    totalFMchannels);
+      totalFMchannels = 0;
+    }
+    if (totalDABchannels == 0 || currentDABchannel < 1 ||
+        currentDABchannel > totalDABchannels) {
+      currentDABchannel = 1;
+    }
+    if (totalFMchannels == 0 || currentFMchannel < 1 ||
+        currentFMchannel > totalFMchannels) {
+      currentFMchannel = 1;
+    }
 
     byte magic0, magic1, schema, marker;
     extEEPROM.get(ADDR_SETTINGS_MAGIC_0, magic0);
@@ -135,25 +163,72 @@ void lastEEPROM(){                                               // read back : 
 }
 
 void loadUiSettings() {
-  constexpr uint8_t recordSize = 11;
+  constexpr uint8_t recordSize = 12;
   uint8_t record[recordSize] = {0};
   extEEPROM.read(EEPROM_SIZE, record, sizeof(record));
   const bool validV1 = record[0] == 'U' && record[1] == 'I' &&
                        record[2] == 1 && record[8] == 0xA5;
   const bool validV2 = record[0] == 'U' && record[1] == 'I' &&
                        record[2] == 2 && record[10] == 0xA5;
-  if (validV1 || validV2) {
+  const bool validV3 = record[0] == 'U' && record[1] == 'I' &&
+                       record[2] == 3 && record[11] == 0xA5;
+  if (validV1 || validV2 || validV3) {
     uiSettings.brightness = constrain(record[3], 20, 100);
     uiSettings.dimLevel = constrain(record[4], 5, uiSettings.brightness);
     uiSettings.dimTimeoutIndex = record[5] <= 3 ? record[5] : 1;
     uiSettings.techEnabled = record[6] ? 1 : 0;
     uiSettings.defaultView = record[7] <= 2 ? record[7] : 0;
-    if (validV2) {
+    if (validV2 || validV3) {
       uiSettings.slideshowMode = record[8] <= 2 ? record[8] : 1;
       uiSettings.slideshowLayout = record[9] ? 1 : 0;
     }
+    if (validV3) {
+      uiSettings.fmRegion = sanitizeFmRegion(record[10]);
+    }
   }
+  uiSettings.fmRegion = sanitizeFmRegion(uiSettings.fmRegion);
   persistedUiSettings = pendingUiSettings = uiSettings;
+}
+
+void loadFmDatabaseRegion() {
+  byte marker = 0xFF;
+  byte stored = 0xFF;
+  extEEPROM.get(ADDR_FM_DATABASE_MAGIC, marker);
+  extEEPROM.get(ADDR_FM_DATABASE_REGION, stored);
+  if (marker != FM_DATABASE_MAGIC || stored >= FM_REGION_COUNT) {
+    // Legacy FM tables were created by the original European configuration.
+    marker = FM_DATABASE_MAGIC;
+    stored = static_cast<byte>(FmRegion::Europe);
+    extEEPROM.put(ADDR_FM_DATABASE_MAGIC, marker);
+    extEEPROM.put(ADDR_FM_DATABASE_REGION, stored);
+  }
+  fmDatabaseRegion = stored;
+  refreshFmDatabaseForRegion();
+}
+
+void refreshFmDatabaseForRegion() {
+  if (fmDatabaseRegion == sanitizeFmRegion(uiSettings.fmRegion)) {
+    extEEPROM.get(ADDR_TOTAL_FM_CHANNEL, totalFMchannels);
+    extEEPROM.get(ADDR_CURRENT_FM_CHANNEL, currentFMchannel);
+    if (totalFMchannels == 0) {
+      currentFMchannel = 1;
+    } else if (currentFMchannel < 1 || currentFMchannel > totalFMchannels) {
+      currentFMchannel = 1;
+    }
+  } else {
+    // Preserve the physical table. It becomes visible again if the matching
+    // region is re-selected before another successful FM scan replaces it.
+    totalFMchannels = 0;
+    currentFMchannel = 1;
+  }
+}
+
+void saveFmDatabaseRegion(byte region) {
+  region = sanitizeFmRegion(region);
+  if (fmDatabaseRegion != region) {
+    extEEPROM.put(ADDR_FM_DATABASE_REGION, region);
+    fmDatabaseRegion = region;
+  }
 }
 
 void saveUiSettingsDelayed() {
@@ -161,26 +236,44 @@ void saveUiSettingsDelayed() {
   markSettingsDirty(DIRTY_UI);
 }
 
-void DABreadEEPROM(byte channel){
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1), currentDABchannel);
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 1, ensemble);
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 2, service);
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 3, serviceid);
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 7, compid);
-    extEEPROM.read(ADDR_DAB_CHANNEL + 28*(channel-1) + 11,
-                   reinterpret_cast<uint8_t*>(dabName), 16);
+bool DABreadEEPROM(byte channel){
+    if (channel < 1 || channel > MAX_DAB_STATIONS) return false;
+    uint8_t record[28] = {0};
+    const int result = extEEPROM.read(
+        ADDR_DAB_CHANNEL + 28U * (channel - 1U), record, sizeof(record));
+    if (result != 0 || record[0] != channel) {
+      Serial.printf("[EEPROM][WARN] DAB record %u read failed: result=%d id=%u\n",
+                    channel, result, record[0]);
+      return false;
+    }
+    currentDABchannel = record[0];
+    ensemble = record[1];
+    service = record[2];
+    memcpy(&serviceid, record + 3, sizeof(serviceid));
+    memcpy(&compid, record + 7, sizeof(compid));
+    memcpy(dabName, record + 11, 16);
     dabName[16] = 0;
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28*(channel-1) + 27, dabCharset);
-    //Serial.println("-> Read current channel, ensemble, service, serviceid, compid, dabName, from EEPROM");   
+    dabCharset = record[27];
+    return true;
 }
 
-void FMreadEEPROM(byte channel){
-    extEEPROM.get(ADDR_FM_CHANNEL + 13*(channel-1), currentFMchannel);
-    extEEPROM.get(ADDR_FM_CHANNEL + 13*(channel-1) + 1 , stationFM_l);
-    extEEPROM.get(ADDR_FM_CHANNEL + 13*(channel-1) + 2, stationFM_h);
-    extEEPROM.get(ADDR_FM_CHANNEL + 13*(channel-1) + 3, flag_name_FM);
-    extEEPROM.get(ADDR_FM_CHANNEL + 13*(channel-1) + 4, fmName);
-    //Serial.println("-> Read currentFMchannel, stationFM,fmName from EEPROM");   
+bool FMreadEEPROM(byte channel){
+    if (channel < 1 || channel > MAX_FM_STATIONS) return false;
+    uint8_t record[13] = {0};
+    const int result = extEEPROM.read(
+        ADDR_FM_CHANNEL + 13U * (channel - 1U), record, sizeof(record));
+    if (result != 0 || record[0] != channel) {
+      Serial.printf("[EEPROM][WARN] FM record %u read failed: result=%d id=%u\n",
+                    channel, result, record[0]);
+      return false;
+    }
+    currentFMchannel = record[0];
+    stationFM_l = record[1];
+    stationFM_h = record[2];
+    flag_name_FM = record[3];
+    memcpy(fmName, record + 4, 8);
+    fmName[8] = 0;
+    return true;
 }
 
 // Last volume backup
@@ -260,8 +353,8 @@ void commitDirtySettingsIfDue() {
   if ((settingsDirty & DIRTY_UI) &&
       memcmp(&pendingUiSettings, &persistedUiSettings,
              sizeof(UiSettings)) != 0) {
-    uint8_t record[11] = {
-        'U', 'I', 2,
+    uint8_t record[12] = {
+        'U', 'I', 3,
         pendingUiSettings.brightness,
         pendingUiSettings.dimLevel,
         pendingUiSettings.dimTimeoutIndex,
@@ -269,6 +362,7 @@ void commitDirtySettingsIfDue() {
         pendingUiSettings.defaultView,
         pendingUiSettings.slideshowMode,
         pendingUiSettings.slideshowLayout,
+        sanitizeFmRegion(pendingUiSettings.fmRegion),
         0xA5};
     extEEPROM.write(EEPROM_SIZE, record, sizeof(record));
     persistedUiSettings = pendingUiSettings;

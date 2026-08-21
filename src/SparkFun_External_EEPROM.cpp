@@ -26,6 +26,29 @@
 #include "Arduino.h"
 #include "Wire.h"
 
+namespace {
+
+constexpr int EEPROM_ERROR_INVALID_ARGUMENT = 4;
+constexpr int EEPROM_ERROR_READY_TIMEOUT = 5;
+constexpr int EEPROM_ERROR_SHORT_READ = 6;
+constexpr uint32_t EEPROM_READY_TIMEOUT_MS = 50;
+
+bool waitUntilReady(ExternalEEPROM &eeprom, uint8_t address)
+{
+    const uint32_t startedAt = millis();
+    while (eeprom.isBusy(address))
+    {
+        if (static_cast<uint32_t>(millis() - startedAt) >=
+            EEPROM_READY_TIMEOUT_MS)
+            return false;
+        delayMicroseconds(100);
+        yield();
+    }
+    return true;
+}
+
+} // namespace
+
 bool ExternalEEPROM::begin(uint8_t deviceAddress, TwoWire &wirePort, uint8_t WP)
 {
     if(WP != 255)
@@ -723,7 +746,7 @@ uint32_t ExternalEEPROM::detectMemorySizeBytes()
 // Read a byte from a given location
 uint8_t ExternalEEPROM::read(uint32_t eepromLocation)
 {
-    uint8_t tempByte;
+    uint8_t tempByte = 0xFF;
     read(eepromLocation, &tempByte, 1);
     return tempByte;
 }
@@ -733,6 +756,12 @@ uint8_t ExternalEEPROM::read(uint32_t eepromLocation)
 // Handles a read that straddles the 512kbit barrier
 int ExternalEEPROM::read(uint32_t eepromLocation, uint8_t *buff, uint16_t bufferSize)
 {
+    if (bufferSize == 0)
+        return 0;
+    if (buff == nullptr || eepromLocation >= settings.memorySize_bytes ||
+        bufferSize > settings.memorySize_bytes - eepromLocation)
+        return EEPROM_ERROR_INVALID_ARGUMENT;
+
     int result = 0;
 
     uint16_t received = 0;
@@ -773,8 +802,8 @@ int ExternalEEPROM::read(uint32_t eepromLocation, uint8_t *buff, uint16_t buffer
         }
 
         // See if EEPROM is available or still writing a previous request
-        while (isBusy(settings.deviceAddress) == true) // Poll device's original address, not the modified one
-            delayMicroseconds(100); // This shortens the amount of time waiting between writes but hammers the I2C bus
+        if (!waitUntilReady(*this, settings.deviceAddress))
+            return EEPROM_ERROR_READY_TIMEOUT;
 
         settings.i2cPort->beginTransmission(i2cAddress);
         if (settings.addressSize_bytes > 1)
@@ -782,8 +811,13 @@ int ExternalEEPROM::read(uint32_t eepromLocation, uint8_t *buff, uint16_t buffer
         settings.i2cPort->write((uint8_t)((eepromLocation + received) & 0xFF));   // LSB
 
         result = settings.i2cPort->endTransmission();
+        if (result != 0)
+            return result;
 
-        settings.i2cPort->requestFrom((uint8_t)i2cAddress, (size_t)amtToRead);
+        const size_t available = settings.i2cPort->requestFrom(
+            (uint8_t)i2cAddress, (size_t)amtToRead);
+        if (available != amtToRead)
+            return EEPROM_ERROR_SHORT_READ;
 
         for (uint16_t x = 0; x < amtToRead; x++)
             buff[received + x] = settings.i2cPort->read();
@@ -807,11 +841,13 @@ int ExternalEEPROM::write(uint32_t eepromLocation, uint8_t dataToWrite)
 // Returns the result of the I2C endTransmission
 int ExternalEEPROM::write(uint32_t eepromLocation, const uint8_t *dataToWrite, uint16_t bufferSize)
 {
-    int result = 0;
+    if (bufferSize == 0)
+        return 0;
+    if (dataToWrite == nullptr || eepromLocation >= settings.memorySize_bytes ||
+        bufferSize > settings.memorySize_bytes - eepromLocation)
+        return EEPROM_ERROR_INVALID_ARGUMENT;
 
-    // Error check
-    if (eepromLocation + bufferSize >= settings.memorySize_bytes)
-        bufferSize = settings.memorySize_bytes - eepromLocation;
+    int result = 0;
 
     // Serial.print("bufferSize: ");
     // Serial.println(bufferSize);
@@ -874,8 +910,8 @@ int ExternalEEPROM::write(uint32_t eepromLocation, const uint8_t *dataToWrite, u
         }
 
         // See if EEPROM is available or still writing a previous request
-        while (isBusy(settings.deviceAddress) == true) // Poll device's original address, not the modified one
-            delayMicroseconds(100); // This shortens the amount of time waiting between writes but hammers the I2C bus
+        if (!waitUntilReady(*this, settings.deviceAddress))
+            return EEPROM_ERROR_READY_TIMEOUT;
 
         // Check if we are using Write Protection then disable WP for write access
         if(settings.wpPin != 255 ) digitalWrite(settings.wpPin, LOW);
@@ -889,6 +925,12 @@ int ExternalEEPROM::write(uint32_t eepromLocation, const uint8_t *dataToWrite, u
             settings.i2cPort->write(dataToWrite[recorded + x]);
 
         result = settings.i2cPort->endTransmission(); // Send stop condition
+
+        if (result != 0)
+        {
+            if(settings.wpPin != 255) digitalWrite(settings.wpPin, HIGH);
+            return result;
+        }
 
         recorded += amtToWrite;
 

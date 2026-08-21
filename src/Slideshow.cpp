@@ -11,11 +11,25 @@
 #include <freertos/task.h>
 #include <new>
 #include <stdarg.h>
-#include <stdlib.h>
 
 namespace {
 
 constexpr uint16_t SLS_MAX_SOURCE_WIDTH = 2048;
+
+// Both decoders contain sizeable internal state but are never active at the
+// same time. A union provides one fixed, correctly aligned workspace for
+// either format without allocating from the heap.
+union DecoderWorkspace {
+  JPEGDEC jpeg;
+  PNG png;
+
+  DecoderWorkspace() {}
+  ~DecoderWorkspace() {}
+};
+
+DecoderWorkspace* decoderWorkspace = nullptr;
+uint16_t pngSourceLine[SLS_MAX_SOURCE_WIDTH];
+bool decoderBusy = false;
 
 struct RenderContext {
   Adafruit_ST7735* display;
@@ -140,6 +154,26 @@ void logDecode(Stream* diagnostics, const char* format, ...) {
 
 }  // namespace
 
+bool initializeSlideshowRenderer(Stream* diagnostics) {
+  if (decoderWorkspace != nullptr) return true;
+  decoderWorkspace = static_cast<DecoderWorkspace*>(
+      heap_caps_malloc(sizeof(DecoderWorkspace), MALLOC_CAP_8BIT));
+  if (decoderWorkspace == nullptr) {
+    logDecode(diagnostics,
+              "[SLS][ERROR] fixed decoder workspace allocation failed: need=%u free=%u largest=%u",
+              static_cast<unsigned>(sizeof(DecoderWorkspace)),
+              ESP.getFreeHeap(),
+              heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    return false;
+  }
+  logDecode(diagnostics,
+            "[SLS] decoder workspace allocated once: %u bytes, free=%u largest=%u",
+            static_cast<unsigned>(sizeof(DecoderWorkspace)),
+            ESP.getFreeHeap(),
+            heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  return true;
+}
+
 bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
                         uint32_t length, int16_t x, int16_t y,
                         int16_t width, int16_t height,
@@ -148,6 +182,12 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
       width > 160) {
     return false;
   }
+  if (!initializeSlideshowRenderer(diagnostics)) return false;
+  if (decoderBusy) {
+    logDecode(diagnostics, "[SLS][WARN] decoder workspace is already in use");
+    return false;
+  }
+  decoderBusy = true;
 
   const bool jpeg = data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF;
   const bool png = data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E &&
@@ -159,7 +199,7 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
   const uint32_t startedAt = millis();
   bool success = false;
   logDecode(diagnostics,
-            "[SLS] decode start: %s bytes=%lu decoder=%u free=%u largest=%u stackHwm=%u",
+            "[SLS] decode start: %s bytes=%lu fixedDecoder=%u free=%u largest=%u stackHwm=%u",
             jpeg ? "JPEG" : (png ? "PNG" : "unknown"),
             static_cast<unsigned long>(length),
             static_cast<unsigned>(jpeg ? sizeof(JPEGDEC) : sizeof(PNG)),
@@ -167,14 +207,8 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
   if (jpeg) {
-    JPEGDEC* decoder = new (std::nothrow) JPEGDEC();
-    if (decoder == nullptr) {
-      logDecode(diagnostics,
-                "[SLS][WARN] JPEG decoder allocation failed: need=%u free=%u largest=%u",
-                static_cast<unsigned>(sizeof(JPEGDEC)), ESP.getFreeHeap(),
-                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    } else if (decoder->openRAM(const_cast<uint8_t*>(data), length,
-                                jpegDraw)) {
+    JPEGDEC* decoder = new (&decoderWorkspace->jpeg) JPEGDEC();
+    if (decoder->openRAM(const_cast<uint8_t*>(data), length, jpegDraw)) {
       const int sourceWidth = decoder->getWidth();
       const int sourceHeight = decoder->getHeight();
       if (sourceWidth > 0 && sourceHeight > 0 &&
@@ -191,35 +225,22 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
       decoder->close();
     } else {
       logDecode(diagnostics, "[SLS][WARN] unsupported or damaged JPEG: error=%d",
-                decoder == nullptr ? -1 : decoder->getLastError());
+                decoder->getLastError());
     }
-    delete decoder;
+    decoder->~JPEGDEC();
   } else if (png) {
-    PNG* decoder = new (std::nothrow) PNG();
-    if (decoder == nullptr) {
-      logDecode(diagnostics,
-                "[SLS][WARN] PNG decoder allocation failed: need=%u free=%u largest=%u",
-                static_cast<unsigned>(sizeof(PNG)), ESP.getFreeHeap(),
-                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    } else if (decoder->openRAM(const_cast<uint8_t*>(data), length, pngDraw) ==
-               PNG_SUCCESS) {
+    PNG* decoder = new (&decoderWorkspace->png) PNG();
+    if (decoder->openRAM(const_cast<uint8_t*>(data), length, pngDraw) ==
+        PNG_SUCCESS) {
       const int sourceWidth = decoder->getWidth();
       const int sourceHeight = decoder->getHeight();
       if (sourceWidth > 0 && sourceHeight > 0 &&
           sourceWidth <= SLS_MAX_SOURCE_WIDTH) {
-        context.sourceLine = static_cast<uint16_t*>(
-            malloc(static_cast<size_t>(sourceWidth) * sizeof(uint16_t)));
-        if (context.sourceLine != nullptr) {
-          context.png = decoder;
-          fitImage(context, sourceWidth, sourceHeight, x, y, width, height);
-          success = decoder->decode(&context, 0) == PNG_SUCCESS;
-          free(context.sourceLine);
-          context.sourceLine = nullptr;
-        } else {
-          logDecode(diagnostics,
-                    "[SLS][WARN] PNG scanline allocation failed: need=%u",
-                    static_cast<unsigned>(sourceWidth * sizeof(uint16_t)));
-        }
+        context.sourceLine = pngSourceLine;
+        context.png = decoder;
+        fitImage(context, sourceWidth, sourceHeight, x, y, width, height);
+        success = decoder->decode(&context, 0) == PNG_SUCCESS;
+        context.sourceLine = nullptr;
       }
       if (!success) {
         logDecode(diagnostics, "[SLS][WARN] PNG decode failed: error=%d size=%dx%d",
@@ -228,9 +249,9 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
       decoder->close();
     } else {
       logDecode(diagnostics, "[SLS][WARN] damaged PNG: error=%d",
-                decoder == nullptr ? -1 : decoder->getLastError());
+                decoder->getLastError());
     }
-    delete decoder;
+    decoder->~PNG();
   }
 
   logDecode(diagnostics,
@@ -239,5 +260,6 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
             success ? "OK" : "failed",
             static_cast<unsigned long>(millis() - startedAt), ESP.getFreeHeap(),
             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  decoderBusy = false;
   return success;
 }

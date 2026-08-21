@@ -6,6 +6,7 @@ const uint16_t UI_DIM_TIMEOUT_SECONDS[] = {15, 30, 60, 120};
 constexpr uint16_t UI_GRAY = 0x8410;
 constexpr uint16_t UI_DARK_LINE = 0x3186;
 constexpr uint16_t UI_ORANGE = 0xFD20;
+uint8_t menuFmRegionOnOpen = static_cast<uint8_t>(FmRegion::Europe);
 const char* const UI_DAB_CHANNELS[DAB_FREQS] = {
     "5A", "5B", "5C", "5D", "6A", "6B", "6C", "6D",
     "7A", "7B", "7C", "7D", "8A", "8B", "8C", "8D",
@@ -365,79 +366,6 @@ String utf8Slice(const String& text, uint16_t start, uint16_t count) {
   return text.substring(startByte, endByte);
 }
 
-uint32_t utf8CodepointAt(const String& text, uint16_t index) {
-  uint16_t offset = 0;
-  for (uint16_t current = 0; offset < text.length(); ++current) {
-    const uint32_t codepoint = nextUtf8Codepoint(text, offset);
-    if (current == index) return codepoint;
-  }
-  return 0;
-}
-
-bool uiWrappedLine(const String& text, uint16_t start, String& line,
-                   uint16_t& nextStart) {
-  const uint16_t total = utf8CodepointCount(text);
-  while (start < total && utf8CodepointAt(text, start) == ' ') ++start;
-  while (start < total && utf8CodepointAt(text, start) == '\n') ++start;
-  if (start >= total) {
-    line = "";
-    nextStart = total;
-    return false;
-  }
-
-  uint16_t end = min<uint16_t>(total, start + UI_TEXT_LINE_GLYPHS);
-  uint16_t lastSpace = 0xFFFF;
-  for (uint16_t index = start; index < end; ++index) {
-    const uint32_t codepoint = utf8CodepointAt(text, index);
-    if (codepoint == '\n') {
-      end = index;
-      nextStart = index + 1;
-      line = utf8Slice(text, start, end - start);
-      line.trim();
-      return true;
-    }
-    if (codepoint == ' ') lastSpace = index;
-  }
-
-  if (end < total && lastSpace != 0xFFFF && lastSpace > start) {
-    end = lastSpace;
-    nextStart = lastSpace + 1;
-  } else {
-    nextStart = end;
-  }
-  while (nextStart < total && utf8CodepointAt(text, nextStart) == ' ') {
-    ++nextStart;
-  }
-  line = utf8Slice(text, start, end - start);
-  line.trim();
-  return true;
-}
-
-uint8_t uiWrappedLineCount(const String& text) {
-  uint16_t start = 0;
-  uint8_t count = 0;
-  String ignored;
-  uint16_t next = 0;
-  while (count < 16 && uiWrappedLine(text, start, ignored, next)) {
-    ++count;
-    if (next <= start) break;
-    start = next;
-  }
-  return count;
-}
-
-String uiWrappedLineAt(const String& text, uint8_t requestedLine) {
-  uint16_t start = 0;
-  String line;
-  uint16_t next = 0;
-  for (uint8_t index = 0; index <= requestedLine; ++index) {
-    if (!uiWrappedLine(text, start, line, next)) return String();
-    if (index == requestedLine) return line;
-    start = next;
-  }
-  return String();
-}
-
 uint16_t utf8TextWidth(const String& text, uint8_t size) {
   return utf8CodepointCount(text) * 6U * size;
 }
@@ -465,27 +393,33 @@ uint8_t currentUiStationCount() {
   return dabMode == 1 ? totalDABchannels : totalFMchannels;
 }
 
-void readUiStationLabel(uint8_t channel, char* label, size_t labelSize,
+bool readUiStationLabel(uint16_t channel, char* label, size_t labelSize,
                         uint16_t& frequency, uint8_t& charset) {
   memset(label, 0, labelSize);
   frequency = 0;
   charset = DAB_CHARSET_EBU_LATIN;
+  const uint16_t maximum = dabMode == 1 ? MAX_DAB_STATIONS : MAX_FM_STATIONS;
+  if (channel < 1 || channel > maximum) return false;
   if (dabMode == 1) {
-    extEEPROM.read(ADDR_DAB_CHANNEL + 28 * (channel - 1) + 11,
-                   reinterpret_cast<uint8_t*>(label), 16);
-    label[16] = 0;
-    extEEPROM.get(ADDR_DAB_CHANNEL + 28 * (channel - 1) + 27, charset);
+    uint8_t record[28] = {0};
+    const int result = extEEPROM.read(
+        ADDR_DAB_CHANNEL + 28U * (channel - 1U), record, sizeof(record));
+    if (result != 0 || record[0] != channel) return false;
+    memcpy(label, record + 11, min(labelSize - 1, static_cast<size_t>(16)));
+    charset = record[27];
   } else {
-    uint8_t record[12] = {0};
-    extEEPROM.read(ADDR_FM_CHANNEL + 13 * (channel - 1) + 1,
-                   record, sizeof(record));
-    frequency = 100U * record[1] + 10U * record[0];
-    memcpy(label, record + 3, min(labelSize - 1, static_cast<size_t>(8)));
+    uint8_t record[13] = {0};
+    const int result = extEEPROM.read(
+        ADDR_FM_CHANNEL + 13U * (channel - 1U), record, sizeof(record));
+    if (result != 0 || record[0] != channel) return false;
+    frequency = 100U * record[2] + 10U * record[1];
+    memcpy(label, record + 4, min(labelSize - 1, static_cast<size_t>(8)));
     if (label[0] == 0 || strncmp(label, "unknown?", 8) == 0) {
-      snprintf(label, labelSize, "%u.%1u MHz", frequency / 100,
+      snprintf(label, labelSize, "%u.%1uMHz", frequency / 100,
                (frequency % 100) / 10);
     }
   }
+  return true;
 }
 
 void markUiDirty(uint8_t regions) {
@@ -514,6 +448,7 @@ struct UiStatusSnapshot {
   bool rdsSync;
   bool tp;
   bool ta;
+  char ps[9];
 };
 
 void noteUiStatusChanged() {
@@ -541,11 +476,15 @@ void noteUiStatusChanged() {
   current.rdsSync = Dab.rdsSync;
   current.tp = Dab.tp;
   current.ta = Dab.ta;
+  memcpy(current.ps, Dab.ps, sizeof(current.ps));
   const bool signalChanged = !previousValid ||
       current.signalstrength != previous.signalstrength ||
       current.snr != previous.snr;
   const bool dabTypeChanged = !previousValid ||
       current.dabplus != previous.dabplus;
+  const bool fmHeaderChanged = !previousValid ||
+      current.fmPilot != previous.fmPilot ||
+      current.fmStereoBlend != previous.fmStereoBlend;
   const bool statusChanged = !previousValid ||
       current.quality != previous.quality ||
       current.bitrate != previous.bitrate ||
@@ -556,7 +495,8 @@ void noteUiStatusChanged() {
       current.valid != previous.valid || current.dabplus != previous.dabplus ||
       current.fmPilot != previous.fmPilot ||
       current.rdsSync != previous.rdsSync || current.tp != previous.tp ||
-      current.ta != previous.ta;
+      current.ta != previous.ta ||
+      memcmp(current.ps, previous.ps, sizeof(current.ps)) != 0;
   const bool diagnosticsChanged = !previousValid ||
       current.dsrvPackets != previous.dsrvPackets ||
       current.dlsPackets != previous.dlsPackets ||
@@ -569,9 +509,10 @@ void noteUiStatusChanged() {
   if (signalChanged) markUiDirty(UI_DIRTY_SIGNAL);
   if (statusChanged) markUiDirty(UI_DIRTY_STATUS);
   if (dabMode == 1 && dabTypeChanged) markUiDirty(UI_DIRTY_HEADER);
-  if (signalChanged || statusChanged || diagnosticsChanged) {
-    markUiDirty(UI_DIRTY_TECH);
+  if (uiView == UiView::Tech && dabMode == 0 && fmHeaderChanged) {
+    markUiDirty(UI_DIRTY_HEADER);
   }
+  if (diagnosticsChanged) markUiDirty(UI_DIRTY_TECH);
 }
 
 void updateUiBroadcastText(const String& decoded) {
@@ -620,13 +561,13 @@ void renderUiHeader() {
   char detail[22];
   if (dabMode == 1) {
     const uint32_t frequency = ensemble < DAB_FREQS ? Dab.freq_khz(ensemble) : 0;
-    snprintf(detail, sizeof(detail), "%s %lu.%03lu",
+    snprintf(detail, sizeof(detail), "%s %lu.%03luMHz",
              ensemble < DAB_FREQS ? UI_DAB_CHANNELS[ensemble] : "--",
              static_cast<unsigned long>(frequency / 1000),
              static_cast<unsigned long>(frequency % 1000));
   } else {
     const uint16_t frequency = 100U * stationFM_h + 10U * stationFM_l;
-    snprintf(detail, sizeof(detail), "%u.%1u MHz", frequency / 100,
+    snprintf(detail, sizeof(detail), "%u.%1uMHz", frequency / 100,
              (frequency % 100) / 10);
   }
   drawUtf8Text(String(detail), dabMode == 1 ? 30 : 19, 1,
@@ -647,7 +588,7 @@ String currentUiStationName() {
   name.trim();
   if (name.length() == 0 && dabMode == 0) {
     char fallback[16];
-    snprintf(fallback, sizeof(fallback), "%u.%1u MHz", stationFM_h,
+    snprintf(fallback, sizeof(fallback), "%u.%1uMHz", stationFM_h,
              stationFM_l);
     name = fallback;
   }
@@ -683,7 +624,7 @@ void renderUiTextArea() {
   if (uiView != UiView::Text || scanActive()) return;
   tft.fillRect(0, 42, screenWidth, 37, ST77XX_BLACK);
   if (uiBroadcastText.length() == 0) {
-    drawUtf8Text("Čekám na vysílaný text", 2, 49, 0x7BEF, 1, 156);
+    drawUtf8Text("Waiting for broadcast text", 2, 49, 0x7BEF, 1, 156);
     return;
   }
   const String upper = uiCircularTextSlice(uiTextScrollGlyph,
@@ -765,7 +706,8 @@ void renderUiStatusStatic() {
   } else {
     drawUtf8Text(Dab.fmPilot ? "STEREO" : "MONO", 2, 83,
                  Dab.fmPilot ? ST77XX_GREEN : ST77XX_YELLOW, 1, 44);
-    drawUtf8Text("RDS", 52, 83,
+    const char* rdsLabel = fmRegionProfile(uiSettings.fmRegion).rbds ? "RBDS" : "RDS";
+    drawUtf8Text(rdsLabel, 52, 83,
                  Dab.rdsSync ? ST77XX_GREEN : ST77XX_RED, 1, 24);
     drawUtf8Text("TP", 86, 83, Dab.tp ? ST77XX_GREEN : UI_GRAY, 1, 18);
     drawUtf8Text("TA", 113, 83, Dab.ta ? UI_ORANGE : UI_GRAY, 1, 18);
@@ -822,19 +764,19 @@ bool renderSlideshowScreen() {
   uiView = UiView::Slideshow;
   clearScreen();
   if (dabMode != 1 || uiSettings.slideshowMode == 0) {
-    drawUtf8Text("Slideshow není k dispozici", 7, 51,
+    drawUtf8Text("Slideshow unavailable", 7, 51,
                  ST77XX_YELLOW, 1, 148);
     return false;
   }
   if (!Dab.slideshowAvailable()) {
-    drawUtf8Text("Čekám na slideshow...", 17, 51,
+    drawUtf8Text("Waiting for slideshow...", 17, 51,
                  ST77XX_CYAN, 1, 130);
     uiSlideshowDecodePending = true;
     renderSlideshowStatus();
     return true;
   }
   if (Dab.urgentDataPending()) {
-    drawUtf8Text("Přijímám slideshow...", 17, 51,
+    drawUtf8Text("Receiving slideshow...", 17, 51,
                  ST77XX_CYAN, 1, 130);
     uiSlideshowDecodePending = true;
     return true;
@@ -847,9 +789,9 @@ bool renderSlideshowScreen() {
   uiSlideshowDecodePending = false;
   if (!decoded) {
     clearScreen();
-    drawUtf8Text("Slideshow nelze zobrazit", 5, 44,
+    drawUtf8Text("Cannot display slideshow", 5, 44,
                  ST77XX_RED, 1, 150);
-    drawUtf8Text("JPEG/PNG bylo odmítnuto", 8, 61,
+    drawUtf8Text("JPEG/PNG rejected", 8, 61,
                  UI_GRAY, 1, 144);
     Dab.discardSlideshow();
     markUiDirty(UI_DIRTY_STATUS);
@@ -887,10 +829,11 @@ void flushUiDirty() {
     if ((dirty & UI_DIRTY_TEXT) != 0) renderUiTextArea();
     if ((dirty & UI_DIRTY_STATUS) != 0) renderUiStatusStatic();
     if ((dirty & UI_DIRTY_SIGNAL) != 0) renderUiSignal();
-  } else if (uiView == UiView::Tech &&
-             (dirty & (UI_DIRTY_HEADER | UI_DIRTY_STATUS |
-                       UI_DIRTY_SIGNAL | UI_DIRTY_TECH)) != 0) {
-    renderTechScreen();
+  } else if (uiView == UiView::Tech) {
+    if ((dirty & UI_DIRTY_HEADER) != 0) renderTechHeader();
+    if ((dirty & UI_DIRTY_SIGNAL) != 0) renderTechSignal();
+    if ((dirty & UI_DIRTY_STATUS) != 0) renderTechStatus();
+    if ((dirty & UI_DIRTY_TECH) != 0) renderTechDiagnostics();
   } else if (uiView == UiView::Slideshow &&
              (dirty & (UI_DIRTY_HEADER | UI_DIRTY_STATION |
                        UI_DIRTY_STATUS | UI_DIRTY_SIGNAL)) != 0) {
@@ -898,79 +841,90 @@ void flushUiDirty() {
   }
 }
 
-void renderTechScreen() {
+void renderTechHeader() {
   if (uiView != UiView::Tech || scanActive()) return;
   char line[34];
-  tft.fillRect(0, 0, screenWidth, 14, ST77XX_BLACK);
-  drawUtf8Text(dabMode == 1 ? "DAB" : "FM", 2, 1,
-               ST77XX_YELLOW, 1, 24);
+  tft.fillRect(0, 0, screenWidth, 30, ST77XX_BLACK);
+  const char* band = dabMode == 1
+      ? (Dab.dabplus ? "DAB+" : "DAB") : "FM";
+  drawUtf8Text(band, 2, 1, ST77XX_YELLOW, 1, 24);
   drawUtf8Text("TECH", 61, 1, ST77XX_CYAN, 1, 30);
   snprintf(line, sizeof(line), "V%u", vol);
   drawUtf8Text(String(line), 136, 1, ST77XX_GREEN, 1, 22);
   tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
+
   if (dabMode == 1) {
     const uint32_t frequency = ensemble < DAB_FREQS ? Dab.freq_khz(ensemble) : 0;
-    snprintf(line, sizeof(line), "%s  %lu.%03lu MHz",
+    snprintf(line, sizeof(line), "%s %lu.%03luMHz",
              ensemble < DAB_FREQS ? UI_DAB_CHANNELS[ensemble] : "--",
              static_cast<unsigned long>(frequency / 1000),
              static_cast<unsigned long>(frequency % 1000));
-    tft.fillRect(0, 15, screenWidth, 15, ST77XX_BLACK);
-    drawUtf8Text(String(line), 2, 17, ST77XX_WHITE, 1, 156);
+  } else {
+    snprintf(line, sizeof(line), "%u.%1uMHz  %s %u%%", stationFM_h,
+             stationFM_l, Dab.fmPilot ? "ST" : "MONO", Dab.fmStereoBlend);
+  }
+  drawUtf8Text(String(line), 2, 17, ST77XX_WHITE, 1, 156);
+}
 
-    tft.fillRect(0, 30, screenWidth, 15, ST77XX_BLACK);
-    drawUtf8Text("CNR", 2, 32, ST77XX_CYAN, 1, 24);
-    snprintf(line, sizeof(line), "%d dB", Dab.snr);
-    drawUtf8Text(String(line), 28, 32, uiSignalColor(Dab.snr, true), 1, 42);
-    drawUtf8Text("RSSI", 78, 32, ST77XX_CYAN, 1, 30);
-    snprintf(line, sizeof(line), "%d", Dab.signalstrength);
-    drawUtf8Text(String(line), 110, 32,
-                 uiRssiColor(Dab.signalstrength, true), 1, 46);
+void renderTechSignal() {
+  if (uiView != UiView::Tech || scanActive()) return;
+  char line[16];
+  tft.fillRect(0, 30, screenWidth, 15, ST77XX_BLACK);
+  drawUtf8Text(dabMode == 1 ? "CNR" : "SNR", 2, 32, ST77XX_CYAN, 1, 24);
+  snprintf(line, sizeof(line), "%d dB", Dab.snr);
+  drawUtf8Text(String(line), 28, 32,
+               uiSignalColor(Dab.snr, dabMode == 1), 1, 42);
+  drawUtf8Text("RSSI", 78, 32, ST77XX_CYAN, 1, 30);
+  snprintf(line, sizeof(line), "%d", Dab.signalstrength);
+  drawUtf8Text(String(line), 110, 32,
+               uiRssiColor(Dab.signalstrength, dabMode == 1), 1, 46);
+}
 
-    snprintf(line, sizeof(line), "FIC %u%% %s %ukbit", Dab.quality,
+void renderTechStatus() {
+  if (uiView != UiView::Tech || scanActive()) return;
+  char line[34];
+  tft.fillRect(0, 45, screenWidth, 60, ST77XX_BLACK);
+
+  if (dabMode == 1) {
+    drawUtf8Text("FIC", 2, 47, ST77XX_CYAN, 1, 18);
+    snprintf(line, sizeof(line), "%u%%", Dab.quality);
+    drawUtf8Text(String(line), 26, 47, uiFicColor(Dab.quality), 1, 30);
+    snprintf(line, sizeof(line), "%s %ukbit",
              Dab.dabplus ? "DAB+" : "DAB", Dab.bitrate);
-    tft.fillRect(0, 45, screenWidth, 15, ST77XX_BLACK);
-    drawUtf8Text(String(line), 2, 47, ST77XX_GREEN, 1, 156);
+    drawUtf8Text(String(line), 58, 47, ST77XX_WHITE, 1, 98);
+
     snprintf(line, sizeof(line), "Audio %u Hz  %s", Dab.samplerate,
              audiomode[Dab.mode]);
-    tft.fillRect(0, 60, screenWidth, 15, ST77XX_BLACK);
     drawUtf8Text(String(line), 2, 62, ST77XX_WHITE, 1, 156);
-    snprintf(line, sizeof(line), "SID %08lX", static_cast<unsigned long>(serviceid));
-    tft.fillRect(0, 75, screenWidth, 15, ST77XX_BLACK);
+    snprintf(line, sizeof(line), "SID %08lX",
+             static_cast<unsigned long>(serviceid));
     drawUtf8Text(String(line), 2, 77, UI_GRAY, 1, 156);
-    snprintf(line, sizeof(line), "CID %08lX  %s", static_cast<unsigned long>(compid),
+    snprintf(line, sizeof(line), "CID %08lX  %s",
+             static_cast<unsigned long>(compid),
              broadcastCharsetName(Dab.ServiceDataCharset));
-    tft.fillRect(0, 90, screenWidth, 15, ST77XX_BLACK);
     drawUtf8Text(String(line), 2, 92, UI_GRAY, 1, 156);
   } else {
-    snprintf(line, sizeof(line), "%u.%1u MHz  %s %u%%", stationFM_h,
-             stationFM_l, Dab.fmPilot ? "ST" : "MONO", Dab.fmStereoBlend);
-    tft.fillRect(0, 15, screenWidth, 15, ST77XX_BLACK);
-    drawUtf8Text(String(line), 2, 17, ST77XX_WHITE, 1, 156);
-
-    tft.fillRect(0, 30, screenWidth, 15, ST77XX_BLACK);
-    drawUtf8Text("SNR", 2, 32, ST77XX_CYAN, 1, 24);
-    snprintf(line, sizeof(line), "%d dB", Dab.snr);
-    drawUtf8Text(String(line), 28, 32, uiSignalColor(Dab.snr, false), 1, 42);
-    drawUtf8Text("RSSI", 78, 32, ST77XX_CYAN, 1, 30);
-    snprintf(line, sizeof(line), "%d", Dab.signalstrength);
-    drawUtf8Text(String(line), 110, 32,
-                 uiRssiColor(Dab.signalstrength, false), 1, 46);
-
     snprintf(line, sizeof(line), "PI %04X  PTY %u", Dab.pi, Dab.pty);
-    tft.fillRect(0, 45, screenWidth, 15, ST77XX_BLACK);
     drawUtf8Text(String(line), 2, 47, ST77XX_WHITE, 1, 156);
-    snprintf(line, sizeof(line), "RDS %s  TP %u  TA %u", Dab.rdsSync ? "LOCK" : "--",
+
+    const bool rbds = fmRegionProfile(uiSettings.fmRegion).rbds;
+    snprintf(line, sizeof(line), "%s %s  TP %u  TA %u",
+             rbds ? "RBDS" : "RDS", Dab.rdsSync ? "LOCK" : "--",
              Dab.tp ? 1 : 0, Dab.ta ? 1 : 0);
-    tft.fillRect(0, 60, screenWidth, 15, ST77XX_BLACK);
     drawUtf8Text(String(line), 2, 62,
                  Dab.rdsSync ? ST77XX_GREEN : ST77XX_RED, 1, 156);
+
     const String decodedPs = decodeRdsText(
         reinterpret_cast<const uint8_t*>(Dab.ps), 8);
-    tft.fillRect(0, 75, screenWidth, 15, ST77XX_BLACK);
     drawUtf8Text(String("PS ") + decodedPs, 2, 77, ST77XX_CYAN, 1, 156);
-    tft.fillRect(0, 90, screenWidth, 15, ST77XX_BLACK);
-    drawUtf8Text("Charset Basic RDS", 2, 92, UI_GRAY, 1, 156);
+    drawUtf8Text(rbds ? "Charset Basic RBDS" : "Charset Basic RDS",
+                 2, 92, UI_GRAY, 1, 156);
   }
+}
+
+void renderTechDiagnostics() {
+  if (uiView != UiView::Tech || scanActive()) return;
+  char line[34];
   tft.fillRect(0, 105, screenWidth, 23, ST77XX_BLACK);
   snprintf(line, sizeof(line), "DSRV:%lu DLS:%lu MOT:%lu",
            static_cast<unsigned long>(Dab.dsrvPacketCount()),
@@ -982,6 +936,15 @@ void renderTechScreen() {
            static_cast<unsigned long>(Dab.commandErrorCount()),
            static_cast<unsigned long>(Dab.dsrvOverflowCount()));
   drawUtf8Text(String(line), 2, 117, UI_ORANGE, 1, 156);
+}
+
+void renderTechScreen() {
+  if (uiView != UiView::Tech || scanActive()) return;
+  clearScreen();
+  renderTechHeader();
+  renderTechSignal();
+  renderTechStatus();
+  renderTechDiagnostics();
 }
 
 void cycleUiScreen() {
@@ -1001,21 +964,28 @@ void renderStationList() {
   if (uiView != UiView::StationList) return;
   clearScreen();
   char header[28];
-  snprintf(header, sizeof(header), "Seznam %s  V%u",
+  snprintf(header, sizeof(header), "%s stations  V%u",
            dabMode == 1 ? "DAB" : "FM", vol);
   drawUtf8Text(String(header), 2, 1, ST77XX_CYAN, 1, 156);
   tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
-  const uint8_t total = currentUiStationCount();
+  const uint16_t total = currentUiStationCount();
   if (total == 0) {
-    drawUtf8Text("Žádné stanice - podrž SCAN", 2, 36, ST77XX_RED, 1, 156);
+    drawUtf8Text("No stations - hold SCAN", 2, 36, ST77XX_RED, 1, 156);
     return;
   }
-  if (stationListSelection < stationListTop) stationListTop = stationListSelection;
-  if (stationListSelection >= stationListTop + UI_LIST_ROWS) {
-    stationListTop = stationListSelection - UI_LIST_ROWS + 1;
+  if (stationListSelection < 1) stationListSelection = 1;
+  if (stationListSelection > total) stationListSelection = total;
+  const uint16_t lastTop = total > UI_LIST_ROWS
+                               ? total - UI_LIST_ROWS + 1U : 1U;
+  if (stationListTop < 1) stationListTop = 1;
+  if (stationListTop > lastTop) stationListTop = lastTop;
+  if (stationListSelection < stationListTop) {
+    stationListTop = stationListSelection;
+  } else if (stationListSelection >= stationListTop + UI_LIST_ROWS) {
+    stationListTop = stationListSelection - UI_LIST_ROWS + 1U;
   }
   for (uint8_t row = 0; row < UI_LIST_ROWS; ++row) {
-    const uint8_t channel = stationListTop + row;
+    const uint16_t channel = stationListTop + row;
     if (channel > total) break;
     const int16_t y = 18 + row * 15;
     const bool selected = channel == stationListSelection;
@@ -1025,14 +995,16 @@ void renderStationList() {
     char label[18];
     uint16_t frequency;
     uint8_t charset;
-    readUiStationLabel(channel, label, sizeof(label), frequency, charset);
+    const bool recordValid = readUiStationLabel(
+        channel, label, sizeof(label), frequency, charset);
     char prefix[6];
     snprintf(prefix, sizeof(prefix), "%3u ", channel);
     drawUtf8Text(String(prefix), 1, y, selected ? ST77XX_WHITE : 0x7BEF, 1, 28);
-    const String decodedLabel = dabMode == 1
+    const String decodedLabel = !recordValid ? String("<read error>") :
+        (dabMode == 1
         ? decodeBroadcastText(reinterpret_cast<const uint8_t*>(label), 16,
                               charset)
-        : decodeRdsText(reinterpret_cast<const uint8_t*>(label), 8);
+        : decodeRdsText(reinterpret_cast<const uint8_t*>(label), 8));
     drawUtf8Text(decodedLabel, 30, y,
                  selected ? ST77XX_WHITE : ST77XX_CYAN, 1, 128);
   }
@@ -1043,13 +1015,28 @@ void openStationList() {
                           ? uiView : UiView::Text;
   uiView = UiView::StationList;
   stationListSelection = dabMode == 1 ? currentDABchannel : currentFMchannel;
-  if (stationListSelection == 0) stationListSelection = 1;
-  stationListTop = stationListSelection;
+  const uint16_t total = currentUiStationCount();
+  if (total == 0) {
+    stationListSelection = stationListTop = 1;
+  } else {
+    if (stationListSelection < 1) stationListSelection = 1;
+    if (stationListSelection > total) stationListSelection = total;
+    stationListTop = total > UI_LIST_ROWS
+                         ? min<uint16_t>(stationListSelection,
+                                         total - UI_LIST_ROWS + 1U)
+                         : 1U;
+  }
+  Serial.printf("[UI] station list open: band=%s total=%u selected=%u free=%u min=%u largest=%u stackHwm=%u\n",
+                dabMode == 1 ? "DAB" : "FM", total, stationListSelection,
+                ESP.getFreeHeap(),
+                heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
   renderStationList();
 }
 
 void moveStationList(int8_t direction) {
-  const uint8_t total = currentUiStationCount();
+  const uint16_t total = currentUiStationCount();
   if (total == 0) return;
   if (direction > 0) {
     stationListSelection = stationListSelection < total
@@ -1079,13 +1066,13 @@ void tuneStationListSelection() {
 void renderMenu() {
   if (uiView != UiView::Menu) return;
   clearScreen();
-  drawUtf8Text("Nastavení", 2, 1, ST77XX_CYAN, 1, 156);
+  drawUtf8Text("Settings", 2, 1, ST77XX_CYAN, 1, 156);
   tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
-  constexpr uint8_t menuItems = 7;
+  constexpr uint8_t menuItems = 8;
   constexpr uint8_t visibleItems = 5;
-  const char* labels[menuItems] = {"Jas", "Ztlumení", "Ztlumit po",
-                                   "Slideshow", "SLS vzhled", "TECH",
-                                   "Výchozí"};
+  const char* labels[menuItems] = {
+      "Brightness", "Dim level", "Dim after", "Slideshow",
+      "SLS layout", "TECH", "Default view", "FM region"};
   if (menuSelection < menuTop) menuTop = menuSelection;
   if (menuSelection >= menuTop + visibleItems) {
     menuTop = menuSelection - visibleItems + 1;
@@ -1107,18 +1094,20 @@ void renderMenu() {
                        UI_DIM_TIMEOUT_SECONDS[uiSettings.dimTimeoutIndex]); break;
       case 3: snprintf(value, sizeof(value), "%s",
                        uiSettings.slideshowMode == 0 ? "Off" :
-                       (uiSettings.slideshowMode == 1 ? "Ručně" : "Auto")); break;
+                       (uiSettings.slideshowMode == 1 ? "Manual" : "Auto")); break;
       case 4: snprintf(value, sizeof(value), "%s",
-                       uiSettings.slideshowLayout ? "Celá" : "Info"); break;
+                       uiSettings.slideshowLayout ? "Full" : "Info"); break;
       case 5: snprintf(value, sizeof(value), "%s",
                        uiSettings.techEnabled ? "On" : "Off"); break;
+      case 6: snprintf(value, sizeof(value), "%s",
+                       uiSettings.defaultView == 0 ? "TEXT" :
+                       (uiSettings.defaultView == 1 ? "TECH" : "SLS")); break;
       default: snprintf(value, sizeof(value), "%s",
-                        uiSettings.defaultView == 0 ? "TEXT" :
-                        (uiSettings.defaultView == 1 ? "TECH" : "SLS")); break;
+                        fmRegionProfile(uiSettings.fmRegion).menuName); break;
     }
     drawUtf8Text(String(value), 98, y, ST77XX_GREEN, 1, 60);
   }
-  drawUtf8Text("Dlouhý SELECT = zpět", 2, 116, UI_GRAY, 1, 156);
+  drawUtf8Text("Hold SELECT = back", 2, 116, UI_GRAY, 1, 156);
 }
 
 void applyUiBacklightSettings() {
@@ -1183,6 +1172,16 @@ void adjustMenu(int8_t direction) {
       }
       break;
     }
+    case 7:
+      if (direction > 0) {
+        uiSettings.fmRegion =
+            static_cast<uint8_t>((sanitizeFmRegion(uiSettings.fmRegion) + 1U) %
+                                 FM_REGION_COUNT);
+      } else {
+        const uint8_t region = sanitizeFmRegion(uiSettings.fmRegion);
+        uiSettings.fmRegion = region == 0 ? FM_REGION_COUNT - 1 : region - 1;
+      }
+      break;
   }
   applyUiBacklightSettings();
   saveUiSettingsDelayed();
@@ -1195,13 +1194,20 @@ void openSettingsMenu() {
   uiView = UiView::Menu;
   menuSelection = 0;
   menuTop = 0;
+  menuFmRegionOnOpen = sanitizeFmRegion(uiSettings.fmRegion);
   renderMenu();
 }
 
 void closeSettingsMenu() {
+  const bool fmRegionChanged =
+      sanitizeFmRegion(uiSettings.fmRegion) != menuFmRegionOnOpen;
   saveUiSettingsDelayed();
   uiView = uiViewBeforeModal;
-  renderCurrentUiView();
+  if (fmRegionChanged) {
+    applyFmRegionSelection();
+  } else {
+    renderCurrentUiView();
+  }
 }
 
 bool handleUiButtonEvent(const ButtonEvent& event) {
@@ -1209,10 +1215,10 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
                     event.type == ButtonEventType::Repeat;
   if (uiView == UiView::Menu) {
     if (event.button == ButtonId::ChannelUp && step) {
-      menuSelection = (menuSelection + 1) % 7;
+      menuSelection = (menuSelection + 1) % 8;
       renderMenu();
     } else if (event.button == ButtonId::ChannelDown && step) {
-      menuSelection = menuSelection == 0 ? 6 : menuSelection - 1;
+      menuSelection = menuSelection == 0 ? 7 : menuSelection - 1;
       renderMenu();
     } else if (event.button == ButtonId::VolumeUp && step) {
       adjustMenu(1);
@@ -1258,9 +1264,7 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
       openListAfterBandReady = true;
       dabMode = !dabMode;
       saveModeToEEPROM(dabMode);
-      clearScreen();
-      TFT_aff(dabMode == 1 ? "Starting DAB" : "Starting FM", 40);
-      Dab.beginAsync(dabMode == 1 ? 0 : 1);
+      startBandTransition();
       return true;
     }
   }
@@ -1268,6 +1272,7 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
 }
 
 void serviceUi(uint32_t now) {
+  if (uiBandStarting) return;
   flushUiDirty();
   if (Dab.takeSlideshowUpdate()) {
     uiSlideshowDecodePending = true;

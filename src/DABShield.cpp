@@ -69,13 +69,16 @@ const PropertySetting DAB_PROPERTIES[] = {
 const PropertySetting FM_PROPERTIES[] = {
     {0x0800, 0x8001},  // PIN_CONFIG_ENABLE: INTBOUTEN + analog DAC.
     {0x0000, 0x000D},  // INT_CTL_ENABLE: RSQ, RDS and STC.
+    {0x3100, 8750},    // FM_SEEK_BAND_BOTTOM: replaced from FM region.
+    {0x3101, 10800},   // FM_SEEK_BAND_TOP: replaced from FM region.
+    {0x3102, 10},      // FM_SEEK_FREQUENCY_SPACING: replaced from FM region.
     {0x3204, 10},      // FM_VALID_SNR_THRESHOLD.
     {0x3202, 17},      // FM_VALID_RSSI_THRESHOLD.
     {0x3200, 114},     // FM_VALID_MAX_TUNE_ERROR.
     {0x1710, 0xF83E},  // FM_TUNE_FE_VARM.
     {0x1711, 0x01A4},  // FM_TUNE_FE_VARB.
     {0x1712, 0x0001},  // FM_TUNE_FE_CFG.
-    {0x3900, 0x0001},  // FM_AUDIO_DE_EMPHASIS: 50 us.
+    {0x3900, 0x0001},  // FM_AUDIO_DE_EMPHASIS: replaced from FM region.
     {0x3C00, 0x0001},  // FM_RDS_INTERRUPT_SOURCE: FIFO receive.
     {0x3C01, 0x0004},  // FM_RDS_INTERRUPT_FIFO_COUNT: low-latency batches.
     {0x3C02, 0x0001},  // FM_RDS_CONFIG: enable RDS.
@@ -162,6 +165,10 @@ DAB::DAB()
       _operationDeadlineMs(0),
       _patchOffset(0),
       _fmTuneTarget(0),
+      _fmBandBottom(8750),
+      _fmBandTop(10800),
+      _fmSeekSpacing(10),
+      _fmDeEmphasis(1),
       _dabTuneTarget(0),
       _serviceId(0),
       _componentId(0),
@@ -175,7 +182,6 @@ DAB::DAB()
       _dlsCharset(0),
       _currentServiceIndex(0),
       _currentServiceStored(false),
-      _slideshowArena(nullptr),
       _slideshowTransportId(0),
       _slideshowHighestSegment(0),
       _slideshowTotalSegments(0),
@@ -256,6 +262,21 @@ void DAB::configureAudioPins(uint8_t gain0, uint8_t gain1) {
   setTpaGain(-6);
 }
 
+void DAB::configureFmBand(uint16_t bottom10kHz, uint16_t top10kHz,
+                         uint8_t spacing10kHz, uint8_t deEmphasis) {
+  if (bottom10kHz < 7600) bottom10kHz = 7600;
+  if (top10kHz > 10800) top10kHz = 10800;
+  if (top10kHz < bottom10kHz) top10kHz = bottom10kHz;
+  if (spacing10kHz != 5 && spacing10kHz != 10 && spacing10kHz != 20) {
+    spacing10kHz = 10;
+  }
+  if (deEmphasis > 2) deEmphasis = 1;
+  _fmBandBottom = bottom10kHz;
+  _fmBandTop = top10kHz;
+  _fmSeekSpacing = spacing10kHz;
+  _fmDeEmphasis = deEmphasis;
+}
+
 void DAB::setDiagnostics(Stream* stream) {
   _diagnostics = stream;
 }
@@ -265,17 +286,9 @@ void DAB::setCallback(void (*serviceDataCallback)(void)) {
 }
 
 bool DAB::allocateSlideshowArena() {
-  if (_slideshowArena != nullptr) return true;
-  _slideshowArena = static_cast<uint8_t*>(malloc(DAB_SLS_ARENA_BYTES));
-  if (_slideshowArena == nullptr) {
-    diagnostic("[SLS][ERROR] unable to allocate %lu-byte RAM arena; free=%u largest=%u",
-               static_cast<unsigned long>(DAB_SLS_ARENA_BYTES),
-               ESP.getFreeHeap(),
-               heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    return false;
-  }
+  if (_slideshowEnabled) return true;
   resetSlideshowAssembler(true);
-  diagnostic("[SLS] RAM arena allocated: %lu bytes, free=%u largest=%u",
+  diagnostic("[SLS] fixed RAM arena ready: %lu bytes, free=%u largest=%u",
              static_cast<unsigned long>(DAB_SLS_ARENA_BYTES),
              ESP.getFreeHeap(),
              heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -283,17 +296,10 @@ bool DAB::allocateSlideshowArena() {
 }
 
 void DAB::releaseSlideshowArena() {
-  const bool hadArena = _slideshowArena != nullptr;
-  if (_slideshowArena != nullptr) {
-    free(_slideshowArena);
-    _slideshowArena = nullptr;
-  }
   resetSlideshowAssembler(true);
-  if (hadArena) {
-    diagnostic("[SLS] disabled; RAM arena released, free=%u largest=%u",
-               ESP.getFreeHeap(),
-               heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  }
+  diagnostic("[SLS] disabled; fixed RAM arena retained, free=%u largest=%u",
+             ESP.getFreeHeap(),
+             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 bool DAB::setSlideshowEnabled(bool enabled) {
@@ -315,8 +321,7 @@ bool DAB::slideshowEnabled() const {
 }
 
 bool DAB::slideshowAvailable() const {
-  return _slideshowAvailable && _slideshowArena != nullptr &&
-         _slideshowImageLength > 0;
+  return _slideshowAvailable && _slideshowImageLength > 0;
 }
 
 bool DAB::takeSlideshowUpdate() {
@@ -366,7 +371,19 @@ bool DAB::beginAsync(uint8_t requestedBand) {
   _patchOffset = 0;
   _propertyIndex = 0;
   error = 0;
+  freq = 0;
+  signalstrength = 0;
+  snr = 0;
+  quality = 0;
   valid = false;
+  bitrate = 0;
+  samplerate = 0;
+  type = SERVICE_NONE;
+  mode = DUAL;
+  dabplus = false;
+  pty = 0;
+  pi = 0;
+  ECC = 0;
   numberofservices = 0;
   memset(ServiceData, 0, sizeof(ServiceData));
   ServiceDataLength = 0;
@@ -1114,14 +1131,30 @@ void DAB::configureNextProperty() {
 
   if (settingIndex < count) {
     ++_propertyIndex;
-    const uint16_t value = settings[settingIndex].property == 0xB400
-                               ? dabXpadValue(_slideshowEnabled)
-                               : settings[settingIndex].value;
-    startProperty(settings[settingIndex].property, value,
-                  State::ConfigureBand);
+    const uint16_t property = settings[settingIndex].property;
+    uint16_t value = settings[settingIndex].value;
+    if (_band == 0 && property == 0xB400) {
+      value = dabXpadValue(_slideshowEnabled);
+    } else if (_band == 1) {
+      switch (property) {
+        case 0x3100: value = _fmBandBottom; break;
+        case 0x3101: value = _fmBandTop; break;
+        case 0x3102: value = _fmSeekSpacing; break;
+        case 0x3900: value = _fmDeEmphasis; break;
+        default: break;
+      }
+    }
+    startProperty(property, value, State::ConfigureBand);
     return;
   }
 
+  if (_band == 1) {
+    diagnostic("[RADIO] FM region config: %u.%02u-%u.%02u MHz step=%u kHz de-emphasis=%u us",
+               _fmBandBottom / 100, _fmBandBottom % 100,
+               _fmBandTop / 100, _fmBandTop % 100,
+               static_cast<unsigned>(_fmSeekSpacing) * 10U,
+               _fmDeEmphasis == 0 ? 75U : (_fmDeEmphasis == 1 ? 50U : 0U));
+  }
   _state = State::Identify;
   identify();
 }
@@ -1484,10 +1517,6 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
              length > 10 ? payload[10] : 0, length > 11 ? payload[11] : 0);
   if (!_slideshowEnabled) {
     diagnostic("[SLS][WARN] MOT ignored: slideshow mode is Off");
-    return;
-  }
-  if (_slideshowArena == nullptr) {
-    diagnostic("[SLS][WARN] MOT ignored: RAM arena is not allocated");
     return;
   }
   if (length < 11) {

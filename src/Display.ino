@@ -7,20 +7,6 @@ String decodeDABString(const char* text)
 }
 
 
-void DAB_time(void)
-{
-  if(totalDABchannels != 0) {
-     char timestring[24];
-     Dab.time(&dabtime);
-     sprintf(timestring,"%02d/%02d/%02d %02d:%02d", dabtime.Days,dabtime.Months,dabtime.Year,dabtime.Hours,dabtime.Minutes);
-  }
-}
-
-void FM_time(void)
-{
-    // The compact listening header does not display time.
-}
-
 void DAB_status(void)
 {
   if(totalDABchannels != 0) {
@@ -35,17 +21,6 @@ void FM_status(void)
   }
 }
 
-void Aff_FM_freq(void)
-{
-  tft.setTextColor(ST77XX_WHITE); 
-  char freqstring[20];
-  sprintf(freqstring, "Freq : %3d.%1d MHz",  stationFM_h, stationFM_l);
-  uint8_t x = (screenWidth - String(freqstring).length()*6)/2;                              //character length = 5+1
-  tft.fillRect(0,52,screenWidth,8,0);                                                       //x,y,width,height,color
-  tft.setCursor(x,52);
-  tft.println(freqstring); 
-}
-
 void TFT_aff(String dabName, uint8_t posx)
 {
   dabName = decodeDABString(dabName.c_str());
@@ -54,16 +29,6 @@ void TFT_aff(String dabName, uint8_t posx)
   const int16_t x = width < screenWidth ? (screenWidth - width) / 2 : 0;
   tft.fillRect(0,posx,screenWidth,20,0);
   drawUtf8Text(dabName, x, posx, ST77XX_RED, 2, screenWidth);
-}
-
-void FM_name(char fmName[9], uint8_t posx)
-{
-  String affName = decodeDABString(fmName);
-  affName.trim();
-  const uint16_t width = utf8TextWidth(affName, 2);
-  const int16_t x = width < screenWidth ? (screenWidth - width) / 2 : 0;
-  tft.fillRect(0,posx,screenWidth,20,0);
-  drawUtf8Text(affName, x, posx, ST77XX_RED, 2, screenWidth);
 }
 
 void Message_red(String message, uint8_t posx)
@@ -96,36 +61,6 @@ void Volume(void)
    else markUiDirty(UI_DIRTY_HEADER);
 }
 
-void FM_affNum(void)
-{
-  if(totalFMchannels != 0){
-    uint8_t x;
-    char channelstring[20];                                             
-    sprintf(channelstring,"Channel:%d/%d",currentFMchannel,totalFMchannels);
-    x = (screenWidth - String(channelstring).length()*6)/2;                           //character length = 5+1
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.fillRect(screenWidth/2-2,84,screenWidth,8,0);                                 //x,y,width,height,color
-    tft.setCursor(screenWidth/2-2,84);
-    tft.println(channelstring); 
-  }
-}
-
-void DAB_affNum(void)
-{
-  if(totalDABchannels != 0){
-    uint8_t x;
-    char channelstring[20];  
-    sprintf(channelstring,"Channel:%d/%d",currentDABchannel,totalDABchannels);   
-    x = (screenWidth - String(channelstring).length()*6)/2;                          //character length = 5+1
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.fillRect(screenWidth/2-2,84,screenWidth,8,0);                                //x,y,width,height,color
-    tft.setCursor(screenWidth/2-2,84);
-    tft.println(channelstring); 
-  }
-}
-
 void Aff_Scan_Freq(char freqstring[17], uint8_t posx)
 {
   uint8_t x;
@@ -151,6 +86,7 @@ void Aff_Scan_Service(uint8_t channel, uint8_t posx)
   char channelstring[20];
   uint8_t x;
   tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
   sprintf(channelstring,"Found %d channels",channel);
   uint8_t l = String(channelstring).length();
   x = (screenWidth - l*6)/2;                                                       //character length = 5+1
@@ -163,7 +99,7 @@ void ServiceData(void)
 {
    // During a scan the decoder keeps collecting PS/RadioText, but the scan
    // screen owns the display regions.
-   if (scanActive()) return;
+   if (scanActive() || uiBandStarting) return;
    // DAB UCS-2BE contains zero bytes inside valid characters, therefore the
    // byte length must come from the DLS/RDS assembler rather than strlen().
    const size_t length = min<size_t>(Dab.ServiceDataLength,
