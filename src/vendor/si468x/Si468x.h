@@ -3,7 +3,7 @@
 
 /*
  * Si468x Universal Driver -- single-header, platform-neutral C++11 library
- * Revision: 0.9.5 (documentation metadata only; no runtime library-version API)
+ * Revision: 0.9.6 (documentation metadata only; no runtime library-version API)
  * -----------------------------------------------------------------------
  * Target devices: Si4682 / Si4683 / Si4684 / Si4685 / Si4688 / Si4689
  *
@@ -1105,7 +1105,8 @@ enum class Result : int8_t {
     BufferTooSmall = -7,
     Unsupported = -8,
     MalformedReply = -9,
-    EndOfData = -10
+    EndOfData = -10,
+    Aborted = -11
 };
 
 /*
@@ -1521,8 +1522,7 @@ struct HdDigradStatus {
 
 struct HdEventStatus {
     Status status;
-    // Avoid the Arduino core's interrupts() macro in mixed-platform builds.
-    uint8_t interruptFlags;   // RESP4: DINFO/AINFO/ALERT/PSD/SIS/DSRVLIST/ASRVLIST interrupt flags
+    uint8_t interrupts;       // RESP4: DINFO/AINFO/ALERT/PSD/SIS/DSRVLIST/ASRVLIST interrupt flags
     uint8_t available;        // RESP5: DINFO/AINFO/PSD/SIS/DSRVLIST/ASRVLIST availability flags
     uint16_t audioServiceListVersion;
     uint16_t dataServiceListVersion;
@@ -1534,17 +1534,17 @@ struct HdEventStatus {
     uint8_t alertFrameCount;
     uint8_t alertMessageId;
     uint8_t alertCrc7;
-    HdEventStatus() : interruptFlags(0), available(0), audioServiceListVersion(0), dataServiceListVersion(0),
+    HdEventStatus() : interrupts(0), available(0), audioServiceListVersion(0), dataServiceListVersion(0),
                       sisFlags1(0), sisFlags2(0), psdFlags1(0), psdFlags2(0), alertFlags(0),
                       alertFrameCount(0), alertMessageId(0), alertCrc7(0) {}
 
-    bool dataInfoInterrupt() const { return (interruptFlags & 0x80u)!=0; }
-    bool audioInfoInterrupt() const { return (interruptFlags & 0x40u)!=0; }
-    bool alertInterrupt() const { return (interruptFlags & 0x10u)!=0; }
-    bool psdInterrupt() const { return (interruptFlags & 0x08u)!=0; }
-    bool sisInterrupt() const { return (interruptFlags & 0x04u)!=0; }
-    bool dataServiceListInterrupt() const { return (interruptFlags & 0x02u)!=0; }
-    bool audioServiceListInterrupt() const { return (interruptFlags & 0x01u)!=0; }
+    bool dataInfoInterrupt() const { return (interrupts & 0x80u)!=0; }
+    bool audioInfoInterrupt() const { return (interrupts & 0x40u)!=0; }
+    bool alertInterrupt() const { return (interrupts & 0x10u)!=0; }
+    bool psdInterrupt() const { return (interrupts & 0x08u)!=0; }
+    bool sisInterrupt() const { return (interrupts & 0x04u)!=0; }
+    bool dataServiceListInterrupt() const { return (interrupts & 0x02u)!=0; }
+    bool audioServiceListInterrupt() const { return (interrupts & 0x01u)!=0; }
     bool dataInfoAvailable() const { return (available & 0x80u)!=0; }
     bool audioInfoAvailable() const { return (available & 0x40u)!=0; }
     bool psdAvailable() const { return (available & 0x08u)!=0; }
@@ -1727,6 +1727,8 @@ public:
                _irqPending(0), _state(State::Idle), _lastResult(Result::Ok), _reply(0),
                _replyLength(0), _deadline(0), _nextCtsPoll(0), _nextIdlePoll(0),
                _ctsPollIntervalUs(1000), _idlePollIntervalUs(50000), _lastDeviceError(0),
+               _lastServiceTime(0), _lastServiceGap(0), _lastDeadlineLateness(0),
+               _serviceTimeValid(false),
                _detectedPart(Part::Unknown), _activeImage(Image::Unknown) {}
 
     // SI468X-API: Si468x | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side configuration) | SI468X-AN649: host abstraction
@@ -1788,7 +1790,9 @@ public:
         }
         Result r=delayUs(resetAssertUs); if (r!=Result::Ok) return r;
         _host.setReset(_host.context,false);
-        return delayUs(resetReleaseUs);
+        r=delayUs(resetReleaseUs);
+        if (r==Result::Ok) (void)abortCommand();
+        return r;
     }
 
     /* Call from the platform ISR.  Do not perform bus traffic in the ISR. */
@@ -1799,6 +1803,10 @@ public:
     bool busy() const { return _state != State::Idle; }
     // SI468X-API: lastResult | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: any state | SI468X-AN649: host-side state/event engine
     Result lastResult() const { return _lastResult; }
+    // SI468X-API: lastServiceGapUs | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side diagnostics) | SI468X-AN649: host abstraction
+    uint32_t lastServiceGapUs() const { return _lastServiceGap; }
+    // SI468X-API: lastDeadlineLatenessUs | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side diagnostics) | SI468X-AN649: host abstraction
+    uint32_t lastDeadlineLatenessUs() const { return _lastDeadlineLateness; }
     // SI468X-API: lastStatus | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: any state | SI468X-AN649: host-side state/event engine
     const Status& lastStatus() const { return _lastStatus; }
     // SI468X-API: lastDeviceError | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: any state | SI468X-AN649: ERR_CMD DATA_0 error code
@@ -1931,10 +1939,45 @@ public:
         _reply=reply; _replyLength=replyLength;
         _deadline = now + timeoutUs;
         _nextCtsPoll = now;
+        _lastServiceTime = now;
+        _lastServiceGap = 0;
+        _lastDeadlineLateness = 0;
+        _serviceTimeValid = _host.timeUs != 0;
         _lastResult=Result::Pending;
         _lastDeviceError=0;
         _state=State::WaitCts;
         return Result::Pending;
+    }
+
+    /*
+     * Cancel only host-side command state. No command or status transaction is
+     * performed. Use this after a confirmed physical device reset or when the
+     * application deliberately abandons an operation whose reply buffer and
+     * completion can no longer be accepted. It is not a substitute for normal
+     * command serialization: a live command must not be aborted merely to hide
+     * an application scheduling error.
+     *
+     * Returns Aborted when WaitCts was cancelled and Ok when already Idle.
+     * Existing Result numeric values are preserved.
+     */
+    // SI468X-API: abortCommand | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side state only) | SI468X-AN649: host abstraction
+    Result abortCommand() {
+        const bool wasBusy=busy();
+        _state=State::Idle;
+        _reply=0;
+        _replyLength=0;
+        _irqPending=0;
+        _deadline=0;
+        _nextCtsPoll=0;
+        _nextIdlePoll=_host.timeUs ? nowUs()+_idlePollIntervalUs : 0u;
+        _lastServiceTime=0;
+        _lastServiceGap=0;
+        _lastDeadlineLateness=0;
+        _serviceTimeValid=false;
+        _lastDeviceError=0;
+        _lastStatus=Status();
+        _lastResult=wasBusy ? Result::Aborted : Result::Ok;
+        return _lastResult;
     }
 
     /*
@@ -1945,14 +1988,18 @@ public:
     // SI468X-API: service | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: command/state dependent | SI468X-AN649: common command/response engine
     Result service() {
         const uint32_t now = nowUs();
+        if (_host.timeUs) {
+            if (_serviceTimeValid) _lastServiceGap=now-_lastServiceTime;
+            _lastServiceTime=now;
+            _serviceTimeValid=true;
+        }
         if (_state == State::WaitCts) {
-            if (_host.timeUs && timeReached(now, _deadline)) {
-                finish(Result::Timeout); return _lastResult;
-            }
+            const bool deadlineReached=_host.timeUs && timeReached(now,_deadline);
+            _lastDeadlineLateness=deadlineReached ? now-_deadline : 0u;
             // If the platform does not provide a timer, poll once per service() call.
             // This keeps the cooperative non-blocking API usable on very small bare-metal
             // hosts; only timeout enforcement then remains unavailable.
-            if (_host.timeUs && !_irqPending && _ctsPollIntervalUs && !timeReached(now, _nextCtsPoll))
+            if (!deadlineReached && _host.timeUs && !_irqPending && _ctsPollIntervalUs && !timeReached(now, _nextCtsPoll))
                 return Result::Pending;
             _irqPending=0;
             _nextCtsPoll = now + _ctsPollIntervalUs;
@@ -1960,7 +2007,10 @@ public:
             if (!_host.readReply(_host.context, s, 4)) { finish(Result::TransportError); return _lastResult; }
             parseStatus(s, 4, _lastStatus);
             if (_statusCallback) _statusCallback(_statusContext, _lastStatus);
-            if (!_lastStatus.cts()) return Result::Pending;
+            if (!_lastStatus.cts()) {
+                if (deadlineReached) finish(Result::Timeout);
+                return _lastResult;
+            }
 
             if (_replyLength) {
                 if (!_host.readReply(_host.context, _reply, _replyLength)) {
@@ -3006,7 +3056,7 @@ public:
     // SI468X-API: parseHdEventStatus | SI468X-SUPPORT: Si4682 Si4683 Si4688 Si4689 | SI468X-FIRMWARE: none; host-side parser for HD_GET_EVENT_STATUS | SI468X-AN649: reply parser
     static Result parseHdEventStatus(const uint8_t* r, size_t n, HdEventStatus& o) {
         if (!r || n<18) return Result::MalformedReply;
-        parseStatus(r,n,o.status); o.interruptFlags=r[4]; o.available=r[5];
+        parseStatus(r,n,o.status); o.interrupts=r[4]; o.available=r[5];
         o.audioServiceListVersion=readLe16(r+6); o.dataServiceListVersion=readLe16(r+8);
         o.sisFlags1=r[10]; o.sisFlags2=r[11]; o.psdFlags1=r[12]; o.psdFlags2=r[13];
         o.alertFlags=r[14]; o.alertFrameCount=r[15]; o.alertMessageId=r[16]; o.alertCrc7=r[17];
@@ -3122,6 +3172,8 @@ private:
     uint32_t _deadline, _nextCtsPoll, _nextIdlePoll;
     uint32_t _ctsPollIntervalUs, _idlePollIntervalUs;
     uint8_t _lastDeviceError;
+    uint32_t _lastServiceTime, _lastServiceGap, _lastDeadlineLateness;
+    bool _serviceTimeValid;
     Part _detectedPart;
     Image _activeImage;
 
@@ -3162,12 +3214,7 @@ struct DabServiceEntry {
 struct DabComponentEntry {
     uint8_t serviceIndex;
     uint8_t componentIndex;
-    /*
-     * Exact four-byte component entry returned by GET_DIGITAL_SERVICE_LIST.
-     * Pass this value unchanged as COMP_ID to START_DIGITAL_SERVICE and the
-     * DAB component/sub-channel information commands. This intentionally
-     * preserves the information bytes above the 16-bit TMId/reference field.
-     */
+        /* Actual 16-bit COMP_ID decoded from the four-byte component entry. */
     uint32_t componentId;
     uint16_t rawComponentField;
     uint16_t componentReference; // SubChId/FIDCId/SCId decoded from rawComponentField.
@@ -3192,9 +3239,8 @@ struct DabServiceListSink {
  * Feed bytes beginning at RESP4 (the first list-size byte), i.e. do not feed the
  * four status bytes.  Chunks may be arbitrarily small but must be supplied in
  * order. Only 24 bytes of parser storage are required regardless of list size.
- * Component callbacks expose both the exact 32-bit list entry (componentId)
- * and decoded TMId/reference fields; the exact value is the safe value to feed
- * back to Si468x component/service commands.
+     * Component callbacks expose the 16-bit COMP_ID plus decoded
+     * TMId/reference and information flags from the remaining bytes.
  */
 class DabServiceListParser {
 public:
@@ -3236,7 +3282,7 @@ private:
     void processRecord() {
         if (_phase==Phase::Header) {
             DabServiceListHeader h; h.listSize=readLe16(_buf); h.version=readLe16(_buf+2); h.numberOfServices=_buf[4];
-            if (h.listSize>2694u || h.numberOfServices>=32u) { _error=true; return; }
+            if (h.listSize>2694u || h.numberOfServices>32u) { _error=true; return; }
             _servicesExpected=h.numberOfServices;
             if (_sink.onHeader) _sink.onHeader(_sink.context,h);
             _have=0;
@@ -3258,7 +3304,11 @@ private:
         }
         if (_phase==Phase::Component) {
             DabComponentEntry c; memset(&c,0,sizeof(c)); const uint16_t raw=readLe16(_buf);
-            c.serviceIndex=_serviceIndex; c.componentIndex=_componentIndex; c.componentId=readLe32(_buf);
+            c.serviceIndex=_serviceIndex; c.componentIndex=_componentIndex;
+            // The first 16 bits are COMP_ID. Bytes 2 and 3 contain ASCTy,
+            // primary/CA and user-application flags and must not be passed to
+            // START_DIGITAL_SERVICE or compared with the DSRV component ID.
+            c.componentId=readLe16(_buf);
             c.rawComponentField=raw; c.transportModeId=(uint8_t)(raw>>14);
             c.dataGroupFlag=(c.transportModeId==3u)&&((raw&0x2000u)!=0);
             c.componentReference=(c.transportModeId==3u)?(uint16_t)(raw&0x0FFFu):(uint16_t)(raw&0x003Fu);

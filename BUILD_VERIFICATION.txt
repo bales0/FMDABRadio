@@ -1,0 +1,31 @@
+FMDABRadio build verification - 2026-10-01
+
+Reference comparison:
+- bales0/SI4684-FMDAB-Receiver commit c4c2a7d08f51a86003f33121e548a02d0cd333fd
+- Hardware-specific code was adapted; it is intentionally not byte-identical.
+
+PlatformIO environment: FMDABRadio
+- Result: SUCCESS
+- Framework: Arduino ESP32 2.0.17
+- RAM: 104120 / 327680 bytes (31.8%)
+- Flash: 441601 / 1310720 bytes (33.7%)
+
+Desktop C++11 regression tests:
+- test_radio_scheduler: PASS
+- test_fm_features: PASS
+- test_dab_service_switch: PASS
+- test_jpeg: PASS
+
+Structural checks:
+- one consolidated radio implementation: src/si4684.cpp/.h
+- obsolete DABShield and root Si468x implementations removed
+- shared ST7735/Si4684 SPI topology retained
+- Si4684 INTB remains on GPIO26; ISR performs no SPI
+- DAB external image address: 0x086000
+- FM external image address: 0x106000
+- legacy EEPROM station layouts retained
+- UI v4 settings and FM scan metadata use separate extension addresses
+
+Hardware verification is still required for RF sensitivity, AF switching,
+DAB audio/data service changes, MOT slideshow traffic, physical buttons,
+EEPROM endurance and the ST7735 shared-SPI display.

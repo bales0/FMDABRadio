@@ -4,8 +4,11 @@ void Backlight::begin(uint8_t pin, uint32_t now) {
   _pin = pin;
   _lastActivityMs = now;
   _lastFadeMs = now;
-  _currentDuty = PWM_MAX;
-  _targetDuty = PWM_MAX;
+  // Keep the panel dark until setup has drawn a complete, valid first frame
+  // and loaded the persisted brightness. This also avoids a white flash while
+  // the ST7735 controller is still in reset/initialisation.
+  _currentDuty = 0;
+  _targetDuty = 0;
   ledcSetup(PWM_CHANNEL, PWM_FREQUENCY_HZ, PWM_BITS);
   ledcAttachPin(_pin, PWM_CHANNEL);
   ledcWrite(PWM_CHANNEL, _currentDuty);

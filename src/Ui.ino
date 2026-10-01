@@ -1,18 +1,49 @@
 constexpr uint8_t UI_LIST_ROWS = 7;
 constexpr uint8_t UI_TEXT_LINE_GLYPHS = 26;
-constexpr uint8_t UI_TEXT_WINDOW_GLYPHS = UI_TEXT_LINE_GLYPHS * 2;
-constexpr uint16_t UI_TEXT_SCROLL_STEP_MS = 220;
+constexpr uint8_t UI_TEXT_WINDOW_GLYPHS = UI_TEXT_LINE_GLYPHS;
+constexpr uint16_t UI_TEXT_SCROLL_STEP_MS = 35;
 const uint16_t UI_DIM_TIMEOUT_SECONDS[] = {15, 30, 60, 120};
 constexpr uint16_t UI_GRAY = 0x8410;
 constexpr uint16_t UI_DARK_LINE = 0x3186;
 constexpr uint16_t UI_ORANGE = 0xFD20;
+constexpr uint8_t UI_MENU_ITEMS = 11;
 uint8_t menuFmRegionOnOpen = static_cast<uint8_t>(FmRegion::Europe);
+uint32_t uiObservedMotPackets = 0;
+uint32_t uiMotActivityUntilMs = 0;
+uint32_t uiMotReadyUntilMs = 0;
+bool uiObservedMotCollecting = false;
+uint8_t uiObservedMotProgress = 0;
 const char* const UI_DAB_CHANNELS[DAB_FREQS] = {
     "5A", "5B", "5C", "5D", "6A", "6B", "6C", "6D",
     "7A", "7B", "7C", "7D", "8A", "8B", "8C", "8D",
     "9A", "9B", "9C", "9D", "10A", "10B", "10C", "10D",
     "11A", "11B", "11C", "11D", "12A", "12B", "12C", "12D",
     "13A", "13B", "13C", "13D", "13E", "13F"};
+
+const char* uiText(const char* english, const char* czech) {
+  return uiSettings.language == 1 ? czech : english;
+}
+
+uint16_t uiAccentColor() {
+  return uiSettings.theme == 1 ? UI_ORANGE
+       : uiSettings.theme == 2 ? 0x5DDF : ST77XX_CYAN;
+}
+
+uint16_t uiStationColor() {
+  return uiSettings.theme == 1 ? ST77XX_YELLOW
+       : uiSettings.theme == 2 ? 0xB7FF : ST77XX_RED;
+}
+
+int16_t uiSignalValue(int8_t dbuv) {
+  if (uiSettings.signalUnits == 1) return static_cast<int16_t>(dbuv) + 6;
+  if (uiSettings.signalUnits == 2) return dbuv;
+  return static_cast<int16_t>(dbuv) - 107;
+}
+
+const char* uiSignalUnitName() {
+  return uiSettings.signalUnits == 1 ? "dBf"
+       : uiSettings.signalUnits == 2 ? "dBuV" : "dBm";
+}
 
 uint32_t nextUtf8Codepoint(const String& text, uint16_t& offset) {
   if (offset >= text.length()) return 0;
@@ -426,6 +457,48 @@ void markUiDirty(uint8_t regions) {
   uiDirtyFlags |= regions;
 }
 
+dab_scheduler::SignalDisplayFilter uiSignalFilter;
+uint32_t uiSignalNextStepMs = 0;
+
+int16_t uiRoundedTenths(int16_t value) {
+  return value >= 0 ? (value + 5) / 10 : (value - 5) / 10;
+}
+
+int8_t uiDisplayedRssi() {
+  return uiSignalFilter.valid
+      ? static_cast<int8_t>(uiRoundedTenths(uiSignalFilter.displayedSignal10))
+      : Dab.signalstrength;
+}
+
+int8_t uiDisplayedSnr() {
+  return uiSignalFilter.valid
+      ? static_cast<int8_t>(uiRoundedTenths(uiSignalFilter.displayedCnr10))
+      : Dab.snr;
+}
+
+uint8_t uiDisplayedQuality() {
+  return uiSignalFilter.valid
+      ? static_cast<uint8_t>((uiSignalFilter.displayedQuality10 + 5U) / 10U)
+      : Dab.quality;
+}
+
+void serviceUiSignalFilter(uint32_t now) {
+  const bool fm = dabMode == 0;
+  const bool newSample = uiSignalFilter.acceptSample(
+      Dab.signalSampleGeneration(), fm,
+      static_cast<int16_t>(Dab.signalstrength) * 10, Dab.snr, Dab.quality);
+  const uint32_t interval = fm
+      ? dab_scheduler::FM_SIGNAL_UI_INTERVAL_MS
+      : dab_scheduler::DAB_SIGNAL_UI_INTERVAL_MS;
+  if (newSample && uiSignalNextStepMs == 0U) uiSignalNextStepMs = now;
+  if (uiSignalNextStepMs != 0U &&
+      dab_scheduler::deadlineReached(now, uiSignalNextStepMs)) {
+    uiSignalFilter.stepDisplay(false);
+    uiSignalNextStepMs = now + interval;
+    markUiDirty(UI_DIRTY_SIGNAL);
+  }
+}
+
 struct UiStatusSnapshot {
   int8_t signalstrength;
   int8_t snr;
@@ -442,12 +515,18 @@ struct UiStatusSnapshot {
   uint32_t irqCount;
   uint32_t commandErrors;
   uint32_t dsrvOverflows;
+  uint32_t fmClockGeneration;
+  uint8_t motProgress;
+  uint8_t afCount;
   bool valid;
   bool dabplus;
   bool fmPilot;
   bool rdsSync;
   bool tp;
   bool ta;
+  bool motCollecting;
+  bool motAvailable;
+  bool afActive;
   char ps[9];
 };
 
@@ -455,9 +534,9 @@ void noteUiStatusChanged() {
   static UiStatusSnapshot previous = {};
   static bool previousValid = false;
   UiStatusSnapshot current = {};
-  current.signalstrength = Dab.signalstrength;
-  current.snr = Dab.snr;
-  current.quality = Dab.quality;
+  current.signalstrength = uiDisplayedRssi();
+  current.snr = uiDisplayedSnr();
+  current.quality = uiDisplayedQuality();
   current.bitrate = Dab.bitrate;
   current.samplerate = Dab.samplerate;
   current.pi = Dab.pi;
@@ -470,12 +549,18 @@ void noteUiStatusChanged() {
   current.irqCount = Dab.irqCount();
   current.commandErrors = Dab.commandErrorCount();
   current.dsrvOverflows = Dab.dsrvOverflowCount();
+  current.fmClockGeneration = Dab.fmClockGeneration();
+  current.motProgress = Dab.slideshowProgress();
+  current.afCount = Dab.fmAfList().count;
   current.valid = Dab.valid;
   current.dabplus = Dab.dabplus;
   current.fmPilot = Dab.fmPilot;
   current.rdsSync = Dab.rdsSync;
   current.tp = Dab.tp;
   current.ta = Dab.ta;
+  current.motCollecting = Dab.slideshowCollecting();
+  current.motAvailable = Dab.slideshowAvailable();
+  current.afActive = fmAfActive();
   memcpy(current.ps, Dab.ps, sizeof(current.ps));
   const bool signalChanged = !previousValid ||
       current.signalstrength != previous.signalstrength ||
@@ -496,6 +581,12 @@ void noteUiStatusChanged() {
       current.fmPilot != previous.fmPilot ||
       current.rdsSync != previous.rdsSync || current.tp != previous.tp ||
       current.ta != previous.ta ||
+      current.motProgress != previous.motProgress ||
+      current.motCollecting != previous.motCollecting ||
+      current.motAvailable != previous.motAvailable ||
+      current.afCount != previous.afCount ||
+      current.afActive != previous.afActive ||
+      current.fmClockGeneration != previous.fmClockGeneration ||
       memcmp(current.ps, previous.ps, sizeof(current.ps)) != 0;
   const bool diagnosticsChanged = !previousValid ||
       current.dsrvPackets != previous.dsrvPackets ||
@@ -509,9 +600,7 @@ void noteUiStatusChanged() {
   if (signalChanged) markUiDirty(UI_DIRTY_SIGNAL);
   if (statusChanged) markUiDirty(UI_DIRTY_STATUS);
   if (dabMode == 1 && dabTypeChanged) markUiDirty(UI_DIRTY_HEADER);
-  if (uiView == UiView::Tech && dabMode == 0 && fmHeaderChanged) {
-    markUiDirty(UI_DIRTY_HEADER);
-  }
+  (void)fmHeaderChanged;
   if (diagnosticsChanged) markUiDirty(UI_DIRTY_TECH);
 }
 
@@ -581,12 +670,27 @@ void renderUiHeader() {
 }
 
 String currentUiStationName() {
-  String name = dabMode == 1
-      ? decodeBroadcastText(reinterpret_cast<const uint8_t*>(dabName), 16,
-                            dabCharset)
-      : decodeRdsText(reinterpret_cast<const uint8_t*>(fmName), 8);
+  String name;
+  if (dabMode == 1) {
+    // dabName always represents the selected EEPROM record. A verified live
+    // Service Info label is copied into it by refreshStoredDabLabel(). Reading
+    // ActiveLabel directly here allowed stale scan metadata to hide the name
+    // of the station being previewed or restored after autoscan.
+    name = decodeBroadcastText(reinterpret_cast<const uint8_t*>(dabName), 16,
+                               dabCharset);
+  } else {
+    name = decodeRdsText(reinterpret_cast<const uint8_t*>(fmName), 8);
+  }
   name.trim();
-  if (name.length() == 0 && dabMode == 0) {
+  if (name.length() == 0 && dabMode == 1) {
+    char fallback[17];
+    if (serviceid != 0U) {
+      snprintf(fallback, sizeof(fallback), "DAB service");
+    } else {
+      snprintf(fallback, sizeof(fallback), "DAB station");
+    }
+    name = fallback;
+  } else if (name.length() == 0) {
     char fallback[16];
     snprintf(fallback, sizeof(fallback), "%u.%1uMHz", stationFM_h,
              stationFM_l);
@@ -616,23 +720,25 @@ void renderUiStationName() {
   }
   const uint16_t width = utf8TextWidth(name, 2);
   const int16_t x = width < screenWidth ? (screenWidth - width) / 2 : 0;
-  drawUtf8Text(name, x, 16, ST77XX_RED, 2, screenWidth);
+  drawUtf8Text(name, x, 16,
+               stationPreviewActive ? UI_GRAY : uiStationColor(),
+               2, screenWidth);
   tft.drawFastHLine(0, 40, screenWidth, UI_DARK_LINE);
 }
 
 void renderUiTextArea() {
   if (uiView != UiView::Text || scanActive()) return;
-  tft.fillRect(0, 42, screenWidth, 37, ST77XX_BLACK);
+  tft.fillRect(0, 52, screenWidth, 13, ST77XX_BLACK);
   if (uiBroadcastText.length() == 0) {
-    drawUtf8Text("Waiting for broadcast text", 2, 49, 0x7BEF, 1, 156);
+    drawUtf8Text("Waiting for broadcast text", 2, 55, 0x7BEF, 1, 156);
     return;
   }
-  const String upper = uiCircularTextSlice(uiTextScrollGlyph,
-                                            UI_TEXT_LINE_GLYPHS);
-  const String lower = uiCircularTextSlice(
-      uiTextScrollGlyph + UI_TEXT_LINE_GLYPHS, UI_TEXT_LINE_GLYPHS);
-  drawUtf8Text(upper, 2, 43, ST77XX_WHITE, 1, 156);
-  drawUtf8Text(lower, 2, 58, ST77XX_WHITE, 1, 156);
+  const uint16_t glyphOffset = uiTextScrollGlyph / 6U;
+  const uint8_t pixelOffset = uiTextScrollGlyph % 6U;
+  const String line = uiCircularTextSlice(glyphOffset,
+                                           UI_TEXT_LINE_GLYPHS + 2U);
+  drawUtf8Text(line, 2 - pixelOffset, 55, ST77XX_WHITE, 1,
+               158U + pixelOffset);
 }
 
 uint16_t uiSignalColor(int8_t quality, bool dab) {
@@ -661,23 +767,27 @@ void renderUiSignal() {
   if (scanActive() || uiView != UiView::Text) return;
   tft.fillRect(0, 96, screenWidth, 15, ST77XX_BLACK);
   char value[32];
+  const int8_t displayedSnr = uiDisplayedSnr();
+  const int8_t displayedRssi = uiDisplayedRssi();
   if (dabMode == 1) {
     drawUtf8Text("CNR", 2, 98, ST77XX_CYAN, 1, 24);
-    snprintf(value, sizeof(value), "%d dB", Dab.snr);
-    drawUtf8Text(String(value), 28, 98, uiSignalColor(Dab.snr, true), 1, 45);
+    snprintf(value, sizeof(value), "%d dB", displayedSnr);
+    drawUtf8Text(String(value), 28, 98, uiSignalColor(displayedSnr, true), 1, 45);
     drawUtf8Text("RSSI", 78, 98, ST77XX_CYAN, 1, 30);
-    snprintf(value, sizeof(value), "%d", Dab.signalstrength);
+    snprintf(value, sizeof(value), "%d%s", uiSignalValue(displayedRssi),
+             uiSignalUnitName());
     drawUtf8Text(String(value), 110, 98,
-                 uiRssiColor(Dab.signalstrength, true), 1, 48);
+                 uiRssiColor(displayedRssi, true), 1, 48);
 
   } else {
     drawUtf8Text("SNR", 2, 98, ST77XX_CYAN, 1, 24);
-    snprintf(value, sizeof(value), "%d dB", Dab.snr);
-    drawUtf8Text(String(value), 28, 98, uiSignalColor(Dab.snr, false), 1, 45);
+    snprintf(value, sizeof(value), "%d dB", displayedSnr);
+    drawUtf8Text(String(value), 28, 98, uiSignalColor(displayedSnr, false), 1, 45);
     drawUtf8Text("RSSI", 78, 98, ST77XX_CYAN, 1, 30);
-    snprintf(value, sizeof(value), "%d", Dab.signalstrength);
+    snprintf(value, sizeof(value), "%d%s", uiSignalValue(displayedRssi),
+             uiSignalUnitName());
     drawUtf8Text(String(value), 110, 98,
-                 uiRssiColor(Dab.signalstrength, false), 1, 48);
+                 uiRssiColor(displayedRssi, false), 1, 48);
   }
 }
 
@@ -694,15 +804,37 @@ void renderUiStatusStatic() {
              Dab.samplerate / 1000U,
              shortAudioMode[static_cast<uint8_t>(Dab.mode) & 0x03U]);
     drawUtf8Text(String(value), 2, 83, ST77XX_WHITE, 1, 156);
-    drawUtf8Text("FIC", 2, 113, ST77XX_CYAN, 1, 18);
-    snprintf(value, sizeof(value), "%u%%", Dab.quality);
-    drawUtf8Text(String(value), 26, 113, uiFicColor(Dab.quality), 1, 36);
-    drawUtf8Text("SLS", 68, 113,
-                 Dab.slideshowAvailable() ? ST77XX_GREEN : UI_GRAY, 1, 18);
-    drawUtf8Text("CH", 92, 113, ST77XX_CYAN, 1, 12);
+    drawUtf8Text("RX", 2, 113, Dab.valid ? ST77XX_GREEN : ST77XX_RED, 1, 12);
+    drawUtf8Text("FIC", 20, 113, ST77XX_CYAN, 1, 18);
+    const uint8_t displayedQuality = uiDisplayedQuality();
+    snprintf(value, sizeof(value), "%u%%", displayedQuality);
+    drawUtf8Text(String(value), 44, 113, uiFicColor(displayedQuality), 1, 26);
+    const uint32_t now = millis();
+    const bool motLoading = Dab.slideshowCollecting();
+    const bool motReady = Dab.slideshowAvailable() ||
+        (uiMotReadyUntilMs != 0U &&
+         static_cast<int32_t>(uiMotReadyUntilMs - now) > 0);
+    const bool motPresent = motLoading || motReady ||
+        (uiMotActivityUntilMs != 0U &&
+         static_cast<int32_t>(uiMotActivityUntilMs - now) > 0);
+    drawUtf8Text("MOT", 72, 113,
+                 motReady ? ST77XX_GREEN
+                          : (motLoading ? ST77XX_YELLOW
+                                        : (motPresent ? ST77XX_CYAN : UI_GRAY)),
+                 1, 18);
+    if (motLoading && Dab.slideshowProgress() != 0U)
+      snprintf(value, sizeof(value), "%u%%", Dab.slideshowProgress());
+    else if (motLoading) snprintf(value, sizeof(value), "RX");
+    else snprintf(value, sizeof(value), "%s", motReady ? "OK" :
+                  (motPresent ? "RX" : "--"));
+    drawUtf8Text(String(value), 94, 113,
+                 motReady ? ST77XX_GREEN
+                          : (motLoading ? ST77XX_YELLOW
+                                        : (motPresent ? ST77XX_CYAN : UI_GRAY)),
+                 1, 30);
     snprintf(value, sizeof(value), "%u/%u", currentDABchannel,
              totalDABchannels);
-    drawUtf8Text(String(value), 110, 113, ST77XX_WHITE, 1, 48);
+    drawUtf8Text(String(value), 128, 113, ST77XX_WHITE, 1, 30);
   } else {
     drawUtf8Text(Dab.fmPilot ? "STEREO" : "MONO", 2, 83,
                  Dab.fmPilot ? ST77XX_GREEN : ST77XX_YELLOW, 1, 44);
@@ -711,6 +843,12 @@ void renderUiStatusStatic() {
                  Dab.rdsSync ? ST77XX_GREEN : ST77XX_RED, 1, 24);
     drawUtf8Text("TP", 86, 83, Dab.tp ? ST77XX_GREEN : UI_GRAY, 1, 18);
     drawUtf8Text("TA", 113, 83, Dab.ta ? UI_ORANGE : UI_GRAY, 1, 18);
+    uint16_t afColor = UI_GRAY;
+    if (uiSettings.fmAfEnabled) {
+      afColor = fmAfActive() ? UI_ORANGE
+          : (Dab.fmAfList().count != 0 ? ST77XX_GREEN : ST77XX_CYAN);
+    }
+    drawUtf8Text("AF", 139, 83, afColor, 1, 18);
     snprintf(value, sizeof(value), "PTY %u  PI %04X", Dab.pty, Dab.pi);
     drawUtf8Text(String(value), 2, 113, UI_GRAY, 1, 92);
     snprintf(value, sizeof(value), "%u/%u", currentFMchannel,
@@ -723,8 +861,6 @@ void renderUiStatus() {
   if (scanActive()) return;
   if (uiView == UiView::Slideshow) {
     renderSlideshowStatus();
-  } else if (uiView == UiView::Tech) {
-    renderTechScreen();
   } else if (uiView == UiView::Text) {
     renderUiStatusStatic();
     renderUiSignal();
@@ -756,43 +892,35 @@ void renderSlideshowStatus() {
   char value[8];
   snprintf(value, sizeof(value), "V%u", vol);
   drawUtf8Text(String(value), 106, 115, ST77XX_GREEN, 1, 27);
-  snprintf(value, sizeof(value), "C%d", Dab.snr);
-  drawUtf8Text(String(value), 135, 115, uiSignalColor(Dab.snr, true), 1, 24);
+  const int8_t displayedSnr = uiDisplayedSnr();
+  snprintf(value, sizeof(value), "C%d", displayedSnr);
+  drawUtf8Text(String(value), 135, 115, uiSignalColor(displayedSnr, true), 1, 24);
 }
 
 bool renderSlideshowScreen() {
   uiView = UiView::Slideshow;
-  clearScreen();
   if (dabMode != 1 || uiSettings.slideshowMode == 0) {
+    clearScreen();
     drawUtf8Text("Slideshow unavailable", 7, 51,
                  ST77XX_YELLOW, 1, 148);
     return false;
   }
   if (!Dab.slideshowAvailable()) {
+    clearScreen();
     drawUtf8Text("Waiting for slideshow...", 17, 51,
                  ST77XX_CYAN, 1, 130);
     uiSlideshowDecodePending = true;
     renderSlideshowStatus();
     return true;
   }
-  if (Dab.urgentDataPending()) {
-    drawUtf8Text("Receiving slideshow...", 17, 51,
-                 ST77XX_CYAN, 1, 130);
-    uiSlideshowDecodePending = true;
-    return true;
-  }
-
   const int16_t imageHeight = uiSettings.slideshowLayout ? screenHeight : 112;
   const bool decoded = renderRamSlideshow(
       tft, Dab.slideshowData(), Dab.slideshowLength(), 0, 0,
       screenWidth, imageHeight, &Serial);
   uiSlideshowDecodePending = false;
   if (!decoded) {
-    clearScreen();
-    drawUtf8Text("Cannot display slideshow", 5, 44,
-                 ST77XX_RED, 1, 150);
-    drawUtf8Text("JPEG/PNG rejected", 8, 61,
-                 UI_GRAY, 1, 144);
+    // The decoder validates before its first pixel write. Keep the last valid
+    // screen visible if this carousel object is malformed or unsupported.
     Dab.discardSlideshow();
     markUiDirty(UI_DIRTY_STATUS);
     return false;
@@ -805,9 +933,7 @@ bool renderSlideshowScreen() {
 }
 
 void renderCurrentUiView() {
-  if (uiView == UiView::Tech && uiSettings.techEnabled) {
-    renderTechScreen();
-  } else if (uiView == UiView::Slideshow && dabMode == 1 &&
+  if (uiView == UiView::Slideshow && dabMode == 1 &&
              uiSettings.slideshowMode != 0) {
     renderSlideshowScreen();
   } else {
@@ -829,11 +955,6 @@ void flushUiDirty() {
     if ((dirty & UI_DIRTY_TEXT) != 0) renderUiTextArea();
     if ((dirty & UI_DIRTY_STATUS) != 0) renderUiStatusStatic();
     if ((dirty & UI_DIRTY_SIGNAL) != 0) renderUiSignal();
-  } else if (uiView == UiView::Tech) {
-    if ((dirty & UI_DIRTY_HEADER) != 0) renderTechHeader();
-    if ((dirty & UI_DIRTY_SIGNAL) != 0) renderTechSignal();
-    if ((dirty & UI_DIRTY_STATUS) != 0) renderTechStatus();
-    if ((dirty & UI_DIRTY_TECH) != 0) renderTechDiagnostics();
   } else if (uiView == UiView::Slideshow &&
              (dirty & (UI_DIRTY_HEADER | UI_DIRTY_STATION |
                        UI_DIRTY_STATUS | UI_DIRTY_SIGNAL)) != 0) {
@@ -869,15 +990,18 @@ void renderTechHeader() {
 void renderTechSignal() {
   if (uiView != UiView::Tech || scanActive()) return;
   char line[16];
+  const int8_t displayedSnr = uiDisplayedSnr();
+  const int8_t displayedRssi = uiDisplayedRssi();
   tft.fillRect(0, 30, screenWidth, 15, ST77XX_BLACK);
   drawUtf8Text(dabMode == 1 ? "CNR" : "SNR", 2, 32, ST77XX_CYAN, 1, 24);
-  snprintf(line, sizeof(line), "%d dB", Dab.snr);
+  snprintf(line, sizeof(line), "%d dB", displayedSnr);
   drawUtf8Text(String(line), 28, 32,
-               uiSignalColor(Dab.snr, dabMode == 1), 1, 42);
+               uiSignalColor(displayedSnr, dabMode == 1), 1, 42);
   drawUtf8Text("RSSI", 78, 32, ST77XX_CYAN, 1, 30);
-  snprintf(line, sizeof(line), "%d", Dab.signalstrength);
+  snprintf(line, sizeof(line), "%d%s", uiSignalValue(displayedRssi),
+           uiSignalUnitName());
   drawUtf8Text(String(line), 110, 32,
-               uiRssiColor(Dab.signalstrength, dabMode == 1), 1, 46);
+               uiRssiColor(displayedRssi, dabMode == 1), 1, 46);
 }
 
 void renderTechStatus() {
@@ -887,8 +1011,9 @@ void renderTechStatus() {
 
   if (dabMode == 1) {
     drawUtf8Text("FIC", 2, 47, ST77XX_CYAN, 1, 18);
-    snprintf(line, sizeof(line), "%u%%", Dab.quality);
-    drawUtf8Text(String(line), 26, 47, uiFicColor(Dab.quality), 1, 30);
+    const uint8_t displayedQuality = uiDisplayedQuality();
+    snprintf(line, sizeof(line), "%u%%", displayedQuality);
+    drawUtf8Text(String(line), 26, 47, uiFicColor(displayedQuality), 1, 30);
     snprintf(line, sizeof(line), "%s %ukbit",
              Dab.dabplus ? "DAB+" : "DAB", Dab.bitrate);
     drawUtf8Text(String(line), 58, 47, ST77XX_WHITE, 1, 98);
@@ -904,7 +1029,9 @@ void renderTechStatus() {
              broadcastCharsetName(Dab.ServiceDataCharset));
     drawUtf8Text(String(line), 2, 92, UI_GRAY, 1, 156);
   } else {
-    snprintf(line, sizeof(line), "PI %04X  PTY %u", Dab.pi, Dab.pty);
+    snprintf(line, sizeof(line), "PI %04X  %s", Dab.pi,
+             fm_features::ptyName(
+                 Dab.pty, fmRegionProfile(uiSettings.fmRegion).rbds));
     drawUtf8Text(String(line), 2, 47, ST77XX_WHITE, 1, 156);
 
     const bool rbds = fmRegionProfile(uiSettings.fmRegion).rbds;
@@ -917,8 +1044,15 @@ void renderTechStatus() {
     const String decodedPs = decodeRdsText(
         reinterpret_cast<const uint8_t*>(Dab.ps), 8);
     drawUtf8Text(String("PS ") + decodedPs, 2, 77, ST77XX_CYAN, 1, 156);
-    drawUtf8Text(rbds ? "Charset Basic RBDS" : "Charset Basic RDS",
-                 2, 92, UI_GRAY, 1, 156);
+    if (Dab.fmClockValid) {
+      snprintf(line, sizeof(line), "%02u:%02u %02u.%02u.%04u %+d/2h",
+               Dab.Hours, Dab.Minutes, Dab.Days, Dab.Months, Dab.Year,
+               Dab.fmLocalOffsetHalfHours);
+      drawUtf8Text(String(line), 2, 92, UI_GRAY, 1, 156);
+    } else {
+      drawUtf8Text(rbds ? "Charset Basic RBDS" : "Charset Basic RDS",
+                   2, 92, UI_GRAY, 1, 156);
+    }
   }
 }
 
@@ -947,12 +1081,72 @@ void renderTechScreen() {
   renderTechDiagnostics();
 }
 
+void renderTuneScreen() {
+  if (uiView != UiView::Tune || scanActive()) return;
+  clearScreen();
+  drawUtf8Text(uiText("Manual tuning", "Rucni ladeni"), 2, 1,
+               uiAccentColor(), 1, 156);
+  tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
+  char line[34];
+  if (dabMode == 0) {
+    const uint16_t frequency = Dab.freq != 0 ? Dab.freq
+        : static_cast<uint16_t>(stationFM_h * 100U + stationFM_l * 10U);
+    snprintf(line, sizeof(line), "%u.%02u MHz", frequency / 100,
+             frequency % 100);
+    drawUtf8Text(String(line), 18, 25, uiStationColor(), 2, 140);
+    snprintf(line, sizeof(line), "%s  PI %04X", Dab.valid ? "LOCK" : "----",
+             Dab.pi);
+    drawUtf8Text(String(line), 2, 55, Dab.valid ? ST77XX_GREEN : ST77XX_RED,
+                 1, 156);
+    snprintf(line, sizeof(line), "AF %s  %u/%u", uiSettings.fmAfEnabled ? "ON" : "OFF",
+             Dab.fmAfList().count, Dab.fmAfList().expected);
+    drawUtf8Text(String(line), 2, 72, uiAccentColor(), 1, 156);
+    drawUtf8Text(uiText("CH+/- tune  SCAN seek", "CH+/- ladit SCAN hledat"),
+                 2, 96, ST77XX_WHITE, 1, 156);
+  } else {
+    const uint32_t frequency = Dab.freq_khz(ensemble);
+    snprintf(line, sizeof(line), "%s %lu.%03lu MHz",
+             UI_DAB_CHANNELS[ensemble],
+             static_cast<unsigned long>(frequency / 1000U),
+             static_cast<unsigned long>(frequency % 1000U));
+    drawUtf8Text(String(line), 2, 25, uiStationColor(), 1, 156);
+    snprintf(line, sizeof(line), "%s  services %u",
+             Dab.valid ? "LOCK" : "----", Dab.numberofservices);
+    drawUtf8Text(String(line), 2, 48, Dab.valid ? ST77XX_GREEN : ST77XX_RED,
+                 1, 156);
+    drawUtf8Text(uiText("CH+/- multiplex", "CH+/- multiplex"), 2, 78,
+                 ST77XX_WHITE, 1, 156);
+  }
+  drawUtf8Text(uiText("SELECT next screen", "SELECT dalsi obrazovka"), 2, 114,
+               UI_GRAY, 1, 156);
+}
+
+void manualTuneStep(int8_t direction) {
+  if (!Dab.ready() || scanActive()) return;
+  stationPreviewActive = false;
+  if (dabMode == 0) {
+    manualDabSelectPending = false;
+    const FmRegionProfile& profile = fmRegionProfile(uiSettings.fmRegion);
+    uint16_t frequency = Dab.freq != 0 ? Dab.freq
+        : static_cast<uint16_t>(stationFM_h * 100U + stationFM_l * 10U);
+    frequency = stepFmFrequency(
+        frequency, direction * static_cast<int16_t>(profile.seekSpacing10kHz),
+        uiSettings.fmRegion);
+    stationFM_h = frequency / 100U;
+    stationFM_l = (frequency % 100U) / 10U;
+    flag_sel = false;
+    Dab.requestFmTune(frequency);
+  } else {
+    ensemble = fm_features::nextDabChannel(ensemble, direction > 0);
+    manualDabSelectPending = Dab.requestDabTune(ensemble);
+  }
+  renderTuneScreen();
+}
+
 void cycleUiScreen() {
   if (uiView == UiView::Text && dabMode == 1 &&
       uiSettings.slideshowMode != 0) {
     uiView = UiView::Slideshow;
-  } else if (uiView != UiView::Tech && uiSettings.techEnabled) {
-    uiView = UiView::Tech;
   } else {
     uiView = UiView::Text;
   }
@@ -1011,8 +1205,7 @@ void renderStationList() {
 }
 
 void openStationList() {
-  uiViewBeforeModal = (uiView == UiView::Tech || uiView == UiView::Slideshow)
-                          ? uiView : UiView::Text;
+  uiViewBeforeModal = uiView == UiView::Slideshow ? uiView : UiView::Text;
   uiView = UiView::StationList;
   stationListSelection = dabMode == 1 ? currentDABchannel : currentFMchannel;
   const uint16_t total = currentUiStationCount();
@@ -1066,26 +1259,31 @@ void tuneStationListSelection() {
 void renderMenu() {
   if (uiView != UiView::Menu) return;
   clearScreen();
-  drawUtf8Text("Settings", 2, 1, ST77XX_CYAN, 1, 156);
+  drawUtf8Text(uiText("Settings", "Nastaveni"), 2, 1, uiAccentColor(), 1, 156);
   tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
-  constexpr uint8_t menuItems = 8;
   constexpr uint8_t visibleItems = 5;
-  const char* labels[menuItems] = {
-      "Brightness", "Dim level", "Dim after", "Slideshow",
-      "SLS layout", "TECH", "Default view", "FM region"};
+  const char* labelsEn[UI_MENU_ITEMS] = {
+      "Brightness", "Dim level", "Dim after", "Slideshow", "SLS layout",
+      "FM region", "FM AF", "Signal units", "Theme", "Language",
+      "Serial control"};
+  const char* labelsCs[UI_MENU_ITEMS] = {
+      "Jas", "Jas v klidu", "Ztlumit za", "Slideshow", "Vzhled SLS",
+      "FM oblast", "FM AF", "Jednotky", "Motiv", "Jazyk",
+      "Seriove rizeni"};
   if (menuSelection < menuTop) menuTop = menuSelection;
   if (menuSelection >= menuTop + visibleItems) {
     menuTop = menuSelection - visibleItems + 1;
   }
   for (uint8_t row = 0; row < visibleItems; ++row) {
     const uint8_t item = menuTop + row;
-    if (item >= menuItems) break;
+    if (item >= UI_MENU_ITEMS) break;
     const int16_t y = 19 + row * 19;
     const bool selected = item == menuSelection;
     tft.fillRect(0, y, screenWidth, 18,
                  selected ? 0x04B6 : (item & 1U ? 0x1082 : ST77XX_BLACK));
-    drawUtf8Text(String(labels[item]), 2, y,
-                 selected ? ST77XX_WHITE : ST77XX_CYAN, 1, 92);
+    drawUtf8Text(String(uiSettings.language == 1 ? labelsCs[item]
+                                                  : labelsEn[item]), 2, y,
+                 selected ? ST77XX_WHITE : uiAccentColor(), 1, 92);
     char value[15];
     switch (item) {
       case 0: snprintf(value, sizeof(value), "%u%%", uiSettings.brightness); break;
@@ -1098,16 +1296,22 @@ void renderMenu() {
       case 4: snprintf(value, sizeof(value), "%s",
                        uiSettings.slideshowLayout ? "Full" : "Info"); break;
       case 5: snprintf(value, sizeof(value), "%s",
-                       uiSettings.techEnabled ? "On" : "Off"); break;
+                       fmRegionProfile(uiSettings.fmRegion).menuName); break;
       case 6: snprintf(value, sizeof(value), "%s",
-                       uiSettings.defaultView == 0 ? "TEXT" :
-                       (uiSettings.defaultView == 1 ? "TECH" : "SLS")); break;
+                       uiSettings.fmAfEnabled ? "On" : "Off"); break;
+      case 7: snprintf(value, sizeof(value), "%s", uiSignalUnitName()); break;
+      case 8: snprintf(value, sizeof(value), "%s",
+                        uiSettings.theme == 0 ? "Classic" :
+                        (uiSettings.theme == 1 ? "Amber" : "Ice")); break;
+      case 9: snprintf(value, sizeof(value), "%s",
+                        uiSettings.language == 0 ? "English" : "Cestina"); break;
       default: snprintf(value, sizeof(value), "%s",
-                        fmRegionProfile(uiSettings.fmRegion).menuName); break;
+                        uiSettings.serialControl ? "On" : "Off"); break;
     }
     drawUtf8Text(String(value), 98, y, ST77XX_GREEN, 1, 60);
   }
-  drawUtf8Text("Hold SELECT = back", 2, 116, UI_GRAY, 1, 156);
+  drawUtf8Text(uiText("Hold SELECT = back", "Drzet SELECT = zpet"),
+               2, 116, UI_GRAY, 1, 156);
 }
 
 void applyUiBacklightSettings() {
@@ -1141,38 +1345,12 @@ void adjustMenu(int8_t direction) {
       if (!Dab.setSlideshowEnabled(uiSettings.slideshowMode != 0)) {
         uiSettings.slideshowMode = 0;
       }
-      if (uiSettings.slideshowMode == 0 && uiSettings.defaultView == 2) {
-        uiSettings.defaultView = 0;
-      }
-      uiDefaultSlideshowPending = dabMode == 1 &&
-                                  uiSettings.defaultView == 2 &&
-                                  uiSettings.slideshowMode != 0;
+      uiDefaultSlideshowPending = false;
       break;
     case 4:
       uiSettings.slideshowLayout = !uiSettings.slideshowLayout;
       break;
     case 5:
-      uiSettings.techEnabled = !uiSettings.techEnabled;
-      if (!uiSettings.techEnabled && uiSettings.defaultView == 1) {
-        uiSettings.defaultView = 0;
-      }
-      break;
-    case 6: {
-      uint8_t candidate = uiSettings.defaultView;
-      for (uint8_t tries = 0; tries < 3; ++tries) {
-        candidate = direction > 0 ? (candidate + 1) % 3
-                                  : (candidate == 0 ? 2 : candidate - 1);
-        if ((candidate != 1 || uiSettings.techEnabled) &&
-            (candidate != 2 || uiSettings.slideshowMode != 0)) {
-          uiSettings.defaultView = candidate;
-          uiDefaultSlideshowPending = dabMode == 1 && candidate == 2 &&
-                                      uiSettings.slideshowMode != 0;
-          break;
-        }
-      }
-      break;
-    }
-    case 7:
       if (direction > 0) {
         uiSettings.fmRegion =
             static_cast<uint8_t>((sanitizeFmRegion(uiSettings.fmRegion) + 1U) %
@@ -1182,6 +1360,25 @@ void adjustMenu(int8_t direction) {
         uiSettings.fmRegion = region == 0 ? FM_REGION_COUNT - 1 : region - 1;
       }
       break;
+    case 6:
+      uiSettings.fmAfEnabled = !uiSettings.fmAfEnabled;
+      break;
+    case 7:
+      uiSettings.signalUnits = direction > 0
+          ? (uiSettings.signalUnits + 1U) % 3U
+          : (uiSettings.signalUnits == 0 ? 2 : uiSettings.signalUnits - 1U);
+      break;
+    case 8:
+      uiSettings.theme = direction > 0
+          ? (uiSettings.theme + 1U) % 3U
+          : (uiSettings.theme == 0 ? 2 : uiSettings.theme - 1U);
+      break;
+    case 9:
+      uiSettings.language = !uiSettings.language;
+      break;
+    case 10:
+      uiSettings.serialControl = !uiSettings.serialControl;
+      break;
   }
   applyUiBacklightSettings();
   saveUiSettingsDelayed();
@@ -1189,8 +1386,7 @@ void adjustMenu(int8_t direction) {
 }
 
 void openSettingsMenu() {
-  uiViewBeforeModal = (uiView == UiView::Tech || uiView == UiView::Slideshow)
-                          ? uiView : UiView::Text;
+  uiViewBeforeModal = uiView == UiView::Slideshow ? uiView : UiView::Text;
   uiView = UiView::Menu;
   menuSelection = 0;
   menuTop = 0;
@@ -1215,10 +1411,10 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
                     event.type == ButtonEventType::Repeat;
   if (uiView == UiView::Menu) {
     if (event.button == ButtonId::ChannelUp && step) {
-      menuSelection = (menuSelection + 1) % 8;
+      menuSelection = (menuSelection + 1) % UI_MENU_ITEMS;
       renderMenu();
     } else if (event.button == ButtonId::ChannelDown && step) {
-      menuSelection = menuSelection == 0 ? 7 : menuSelection - 1;
+      menuSelection = menuSelection == 0 ? UI_MENU_ITEMS - 1 : menuSelection - 1;
       renderMenu();
     } else if (event.button == ButtonId::VolumeUp && step) {
       adjustMenu(1);
@@ -1272,10 +1468,37 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
 }
 
 void serviceUi(uint32_t now) {
+  serviceUiSignalFilter(now);
   if (uiBandStarting) return;
+  const uint32_t motPackets = Dab.motPacketCount();
+  const bool motCollecting = Dab.slideshowCollecting();
+  const uint8_t motProgress = Dab.slideshowProgress();
+  if (motPackets != uiObservedMotPackets) {
+    uiObservedMotPackets = motPackets;
+    uiMotActivityUntilMs = now + 3000U;
+    markUiDirty(UI_DIRTY_STATUS);
+  }
+  if (motCollecting != uiObservedMotCollecting ||
+      motProgress != uiObservedMotProgress) {
+    uiObservedMotCollecting = motCollecting;
+    uiObservedMotProgress = motProgress;
+    markUiDirty(UI_DIRTY_STATUS);
+  }
+  if (Dab.slideshowAvailable()) uiMotReadyUntilMs = now + 5000U;
+  if (uiMotActivityUntilMs != 0U &&
+      static_cast<int32_t>(now - uiMotActivityUntilMs) >= 0) {
+    uiMotActivityUntilMs = 0;
+    markUiDirty(UI_DIRTY_STATUS);
+  }
+  if (uiMotReadyUntilMs != 0U && !Dab.slideshowAvailable() &&
+      static_cast<int32_t>(now - uiMotReadyUntilMs) >= 0) {
+    uiMotReadyUntilMs = 0;
+    markUiDirty(UI_DIRTY_STATUS);
+  }
   flushUiDirty();
   if (Dab.takeSlideshowUpdate()) {
     uiSlideshowDecodePending = true;
+    uiMotReadyUntilMs = now + 5000U;
     markUiDirty(UI_DIRTY_STATUS);
   }
 
@@ -1283,21 +1506,23 @@ void serviceUi(uint32_t now) {
       uiSettings.slideshowMode != 0 && Dab.slideshowAvailable()) {
     const bool alreadyVisible = uiView == UiView::Slideshow;
     const bool canAutoOpen = uiSettings.slideshowMode == 2 &&
-                             (uiView == UiView::Text || uiView == UiView::Tech);
-    const bool canDefaultOpen = uiDefaultSlideshowPending &&
-                                uiSettings.defaultView == 2 &&
-                                (uiView == UiView::Text || uiView == UiView::Tech);
+                             uiView == UiView::Text;
+    const bool canDefaultOpen = false;
     if (alreadyVisible || canAutoOpen || canDefaultOpen) {
-      if (!Dab.urgentDataPending()) {
-        const UiView previousView = uiView;
-        if (canDefaultOpen) uiDefaultSlideshowPending = false;
-        if (canAutoOpen || canDefaultOpen) uiView = UiView::Slideshow;
-        uiSlideshowDecodePending = false;
-        const bool rendered = renderSlideshowScreen();
-        if (!rendered && canAutoOpen) {
-          uiView = previousView;
-          renderCurrentUiView();
-        }
+      // A completed image owns the single MOT arena until renderSlideshowScreen()
+      // calls discardSlideshow(). Continuous DSRV/INTB activity therefore
+      // cannot corrupt it and must not starve the decoder waiting for an
+      // artificial "quiet" period.
+      const UiView previousView = uiView;
+      if (canDefaultOpen) uiDefaultSlideshowPending = false;
+      if (canAutoOpen || canDefaultOpen) uiView = UiView::Slideshow;
+      uiSlideshowDecodePending = false;
+      Serial.printf("[SLS/UI] rendering %lu bytes\n",
+                    static_cast<unsigned long>(Dab.slideshowLength()));
+      const bool rendered = renderSlideshowScreen();
+      if (!rendered && canAutoOpen) {
+        uiView = previousView;
+        renderCurrentUiView();
       }
     } else {
       // Manual mode keeps the compressed image ready in RAM and decodes only
@@ -1333,7 +1558,8 @@ void serviceUi(uint32_t now) {
       static_cast<int32_t>(now - uiTextPageDeadlineMs) < 0) {
     return;
   }
-  uiTextScrollGlyph = (uiTextScrollGlyph + 1U) % uiBroadcastLoopGlyphs;
+  uiTextScrollGlyph = (uiTextScrollGlyph + 1U) %
+                      (static_cast<uint32_t>(uiBroadcastLoopGlyphs) * 6U);
   uiTextPageDeadlineMs = now + UI_TEXT_SCROLL_STEP_MS;
   markUiDirty(UI_DIRTY_TEXT);
 }

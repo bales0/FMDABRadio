@@ -1,0 +1,17 @@
+V5 DAB station-label fixes
+==========================
+1. DAB service list now uses the Si468x typed DabServiceListParser.
+   - exact 32-bit ComponentID preserved
+   - TMId and primary component decoded from the correct component field
+   - audio/data classification is no longer derived from ComponentID high bits
+   - raw 16-byte label and SlCharset preserved
+2. charset 0x04 is normalized to UCS-2BE 0x06.
+3. ActiveLabel/ActiveCharset are populated from DAB_GET_SERVICE_INFO.
+4. Active label is also published immediately when the current SID appears in
+   a refreshed service list.
+5. UI prefers ActiveLabel over the EEPROM label while listening.
+
+This fixes both symptoms:
+- most services disappearing during full DAB scan because they were falsely
+  classified as SERVICE_DATA;
+- no live station name when an older EEPROM record contains an empty label.

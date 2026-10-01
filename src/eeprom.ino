@@ -13,6 +13,10 @@ constexpr uint32_t SETTINGS_COMMIT_DELAY_MS = 5000;
 constexpr int ADDR_FM_DATABASE_MAGIC = EEPROM_SIZE + 12;
 constexpr int ADDR_FM_DATABASE_REGION = EEPROM_SIZE + 13;
 constexpr byte FM_DATABASE_MAGIC = 0xB7;
+constexpr int ADDR_UI_SETTINGS_V4 = EEPROM_SIZE + 32;
+constexpr int ADDR_FM_METADATA = EEPROM_SIZE + 64;
+constexpr uint8_t FM_METADATA_RECORD_SIZE = 6;
+constexpr uint8_t FM_METADATA_MARKER = 0xA6;
 
 enum SettingsDirty : uint8_t {
   DIRTY_VOLUME = 1U << 0,
@@ -163,6 +167,11 @@ void lastEEPROM(){                                               // read back : 
 }
 
 void loadUiSettings() {
+  constexpr uint8_t recordV4Size = 17;
+  uint8_t recordV4[recordV4Size] = {0};
+  extEEPROM.read(ADDR_UI_SETTINGS_V4, recordV4, sizeof(recordV4));
+  const bool validV4 = recordV4[0] == 'U' && recordV4[1] == 'I' &&
+                       recordV4[2] == 4 && recordV4[16] == 0xA5;
   constexpr uint8_t recordSize = 12;
   uint8_t record[recordSize] = {0};
   extEEPROM.read(EEPROM_SIZE, record, sizeof(record));
@@ -172,12 +181,26 @@ void loadUiSettings() {
                        record[2] == 2 && record[10] == 0xA5;
   const bool validV3 = record[0] == 'U' && record[1] == 'I' &&
                        record[2] == 3 && record[11] == 0xA5;
-  if (validV1 || validV2 || validV3) {
+  if (validV4) {
+    uiSettings.brightness = constrain(recordV4[3], 20, 100);
+    uiSettings.dimLevel = constrain(recordV4[4], 5, uiSettings.brightness);
+    uiSettings.dimTimeoutIndex = recordV4[5] <= 3 ? recordV4[5] : 1;
+    uiSettings.techEnabled = 0;
+    uiSettings.defaultView = 0;
+    uiSettings.slideshowMode = recordV4[8] <= 2 ? recordV4[8] : 1;
+    uiSettings.slideshowLayout = recordV4[9] ? 1 : 0;
+    uiSettings.fmRegion = sanitizeFmRegion(recordV4[10]);
+    uiSettings.fmAfEnabled = recordV4[11] ? 1 : 0;
+    uiSettings.signalUnits = recordV4[12] <= 2 ? recordV4[12] : 0;
+    uiSettings.theme = recordV4[13] <= 2 ? recordV4[13] : 0;
+    uiSettings.language = recordV4[14] <= 1 ? recordV4[14] : 0;
+    uiSettings.serialControl = recordV4[15] ? 1 : 0;
+  } else if (validV1 || validV2 || validV3) {
     uiSettings.brightness = constrain(record[3], 20, 100);
     uiSettings.dimLevel = constrain(record[4], 5, uiSettings.brightness);
     uiSettings.dimTimeoutIndex = record[5] <= 3 ? record[5] : 1;
-    uiSettings.techEnabled = record[6] ? 1 : 0;
-    uiSettings.defaultView = record[7] <= 2 ? record[7] : 0;
+    uiSettings.techEnabled = 0;
+    uiSettings.defaultView = 0;
     if (validV2 || validV3) {
       uiSettings.slideshowMode = record[8] <= 2 ? record[8] : 1;
       uiSettings.slideshowLayout = record[9] ? 1 : 0;
@@ -251,6 +274,10 @@ bool DABreadEEPROM(byte channel){
     service = record[2];
     memcpy(&serviceid, record + 3, sizeof(serviceid));
     memcpy(&compid, record + 7, sizeof(compid));
+    // V4 builds accidentally stored two service-list flag bytes in the upper
+    // half of COMP_ID. Keep old databases usable and rewrite them naturally
+    // when their live label is refreshed.
+    compid &= 0xFFFFU;
     memcpy(dabName, record + 11, 16);
     dabName[16] = 0;
     dabCharset = record[27];
@@ -274,6 +301,36 @@ bool FMreadEEPROM(byte channel){
     memcpy(fmName, record + 4, 8);
     fmName[8] = 0;
     return true;
+}
+
+bool readFmMetadataFromEEPROM(byte channel, uint16_t& pi, int8_t& rssi,
+                              int8_t& snr) {
+  if (channel < 1 || channel > MAX_FM_STATIONS) return false;
+  uint8_t record[FM_METADATA_RECORD_SIZE] = {0};
+  if (extEEPROM.read(ADDR_FM_METADATA +
+                         FM_METADATA_RECORD_SIZE * (channel - 1U),
+                     record, sizeof(record)) != 0 ||
+      record[0] != FM_METADATA_MARKER ||
+      record[1] != sanitizeFmRegion(uiSettings.fmRegion)) {
+    return false;
+  }
+  pi = static_cast<uint16_t>(record[2]) |
+       (static_cast<uint16_t>(record[3]) << 8);
+  rssi = static_cast<int8_t>(record[4]);
+  snr = static_cast<int8_t>(record[5]);
+  return true;
+}
+
+void saveFmMetadataToEEPROM(byte channel, uint16_t pi, int8_t rssi,
+                            int8_t snr) {
+  if (channel < 1 || channel > MAX_FM_STATIONS) return;
+  const uint8_t record[FM_METADATA_RECORD_SIZE] = {
+      FM_METADATA_MARKER, sanitizeFmRegion(uiSettings.fmRegion),
+      static_cast<uint8_t>(pi), static_cast<uint8_t>(pi >> 8),
+      static_cast<uint8_t>(rssi), static_cast<uint8_t>(snr)};
+  extEEPROM.write(ADDR_FM_METADATA +
+                      FM_METADATA_RECORD_SIZE * (channel - 1U),
+                  record, sizeof(record));
 }
 
 // Last volume backup
@@ -353,8 +410,8 @@ void commitDirtySettingsIfDue() {
   if ((settingsDirty & DIRTY_UI) &&
       memcmp(&pendingUiSettings, &persistedUiSettings,
              sizeof(UiSettings)) != 0) {
-    uint8_t record[12] = {
-        'U', 'I', 3,
+    uint8_t record[17] = {
+        'U', 'I', 4,
         pendingUiSettings.brightness,
         pendingUiSettings.dimLevel,
         pendingUiSettings.dimTimeoutIndex,
@@ -363,8 +420,13 @@ void commitDirtySettingsIfDue() {
         pendingUiSettings.slideshowMode,
         pendingUiSettings.slideshowLayout,
         sanitizeFmRegion(pendingUiSettings.fmRegion),
+        static_cast<uint8_t>(pendingUiSettings.fmAfEnabled ? 1U : 0U),
+        pendingUiSettings.signalUnits,
+        pendingUiSettings.theme,
+        pendingUiSettings.language,
+        static_cast<uint8_t>(pendingUiSettings.serialControl ? 1U : 0U),
         0xA5};
-    extEEPROM.write(EEPROM_SIZE, record, sizeof(record));
+    extEEPROM.write(ADDR_UI_SETTINGS_V4, record, sizeof(record));
     persistedUiSettings = pendingUiSettings;
     written += sizeof(record);
   }

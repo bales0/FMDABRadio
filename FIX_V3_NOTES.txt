@@ -1,0 +1,8 @@
+V3 fixes after runtime test:
+- DAB service-list parser replaced by direct byte-layout parser aligned with SI4684-FMDAB-Receiver.
+- Raw 16-byte service labels preserved; SlCharset stored per service; charset 0x04 normalized to UCS-2BE 0x06.
+- Component TMId decoded from the low 16-bit raw component field (raw >> 14).
+- MOT parser aligned with SI4684-FMDAB-Receiver DSRV payload layout:
+  header payload[2]=0x80,payload[3]=0,payload[4]=0x12,TID[5..6],BodySize[9..12]
+  body payload[2]=LAST,payload[3]=segment,payload[4]=0x12,TID[5..6],image data from payload[9], CRC excluded.
+- 50 KiB packed slideshow arena and 2048-byte segment limit retained.

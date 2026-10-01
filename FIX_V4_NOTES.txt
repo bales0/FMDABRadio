@@ -1,0 +1,4 @@
+V4 fixes based on runtime log:
+1) Initial restored station tune is deferred/retried after BandBoot instead of failing when a transient radio command is active.
+2) Completed slideshow image is rendered without waiting for urgentDataPending()==false. The radio core protects the published single arena by ignoring incoming MOT writes while slideshowAvailable()==true, so continuous DSRV cannot starve UI decode.
+3) Added [SLS/UI] rendering <bytes> diagnostic.

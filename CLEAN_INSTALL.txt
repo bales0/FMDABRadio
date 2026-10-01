@@ -1,0 +1,16 @@
+FMDABRadio clean migration build
+
+IMPORTANT:
+This project intentionally contains only src/si4684.cpp + src/si4684.h as the radio implementation.
+The old files Si4684Radio.cpp/.h and DABShield.cpp/.h must not be present.
+
+If updating an existing checkout, delete at least:
+  src/Si4684Radio.cpp
+  src/Si4684Radio.h
+  src/DABShield.cpp
+  src/DABShield.h
+  src/RadioSchedulerPolicy.h
+
+Then delete the .pio directory or run: pio run -t clean
+
+platformio.ini also excludes stale Si4684Radio.cpp and DABShield.cpp from compilation as an additional safeguard.

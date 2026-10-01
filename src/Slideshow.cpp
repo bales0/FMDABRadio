@@ -1,10 +1,6 @@
 #include "Slideshow.h"
 
-#include <JPEGDEC.h>
-#undef INTELSHORT
-#undef INTELLONG
-#undef MOTOSHORT
-#undef MOTOLONG
+#include "JPEGdecoder.h"
 #include <PNGdec.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -16,18 +12,14 @@ namespace {
 
 constexpr uint16_t SLS_MAX_SOURCE_WIDTH = 2048;
 
-// Both decoders contain sizeable internal state but are never active at the
-// same time. A union provides one fixed, correctly aligned workspace for
-// either format without allocating from the heap.
-union DecoderWorkspace {
-  JPEGDEC jpeg;
-  PNG png;
-
-  DecoderWorkspace() {}
-  ~DecoderWorkspace() {}
-};
-
-DecoderWorkspace* decoderWorkspace = nullptr;
+// JPEG and PNG are never decoded concurrently. Reserve one early, persistent
+// arena and construct the PNG decoder in it only while a PNG is being handled.
+// This mirrors the proven RAM layout of SI4684-FMDAB-Receiver and avoids two
+// large adjacent heap allocations (sizeof(PNG) + JPEG workspace).
+constexpr size_t DECODER_WORKSPACE_BYTES = 76800U;
+static_assert(sizeof(PNG) <= DECODER_WORKSPACE_BYTES,
+              "PNG decoder does not fit in the shared workspace");
+uint8_t* decoderWorkspace = nullptr;
 uint16_t pngSourceLine[SLS_MAX_SOURCE_WIDTH];
 bool decoderBusy = false;
 
@@ -42,6 +34,7 @@ struct RenderContext {
   int destinationY;
   int destinationWidth;
   int destinationHeight;
+  bool outputEnabled;
 };
 
 void fitImage(RenderContext& context, int sourceWidth, int sourceHeight,
@@ -64,54 +57,23 @@ void fitImage(RenderContext& context, int sourceWidth, int sourceHeight,
   context.destinationY = y + (height - context.destinationHeight) / 2;
 }
 
-int jpegDraw(JPEGDRAW* draw) {
-  RenderContext* context = static_cast<RenderContext*>(draw->pUser);
-  if (context == nullptr || context->display == nullptr) return 0;
-  const int blockRight = min(context->sourceWidth, draw->x + draw->iWidthUsed);
-  const int blockBottom = min(context->sourceHeight, draw->y + draw->iHeight);
-  const int destinationLeft =
-      (draw->x * context->destinationWidth + context->sourceWidth - 1) /
-      context->sourceWidth;
-  const int destinationRight =
-      (blockRight * context->destinationWidth + context->sourceWidth - 1) /
-      context->sourceWidth;
-  const int destinationTop =
-      (draw->y * context->destinationHeight + context->sourceHeight - 1) /
-      context->sourceHeight;
-  const int destinationBottom =
-      (blockBottom * context->destinationHeight + context->sourceHeight - 1) /
-      context->sourceHeight;
-
-  for (int destinationY = destinationTop;
-       destinationY < destinationBottom; ++destinationY) {
-    const int sourceY = static_cast<int>(
-        static_cast<int64_t>(destinationY) * context->sourceHeight /
-        context->destinationHeight);
-    const int localY = constrain(sourceY - draw->y, 0, draw->iHeight - 1);
-    int output = 0;
-    for (int destinationX = destinationLeft;
-         destinationX < destinationRight && output < 160; ++destinationX) {
-      const int sourceX = static_cast<int>(
-          static_cast<int64_t>(destinationX) * context->sourceWidth /
-          context->destinationWidth);
-      const int localX = constrain(sourceX - draw->x, 0, draw->iWidthUsed - 1);
-      context->line[output++] =
-          draw->pPixels[localY * draw->iWidth + localX];
-    }
-    if (output > 0) {
-      context->display->drawRGBBitmap(
-          context->destinationX + destinationLeft,
-          context->destinationY + destinationY, context->line, output, 1);
-    }
+void jpegOutput(void* opaque, int32_t x, int32_t y, int32_t width,
+                int32_t height, const uint16_t* pixels) {
+  Adafruit_ST7735* display = static_cast<Adafruit_ST7735*>(opaque);
+  if (display != nullptr && pixels != nullptr && width > 0 && height > 0) {
+    display->drawRGBBitmap(x, y, pixels, width, height);
   }
   delay(0);
-  return 1;
+}
+
+void jpegProgress(void*) {
+  yield();
 }
 
 int pngDraw(PNGDRAW* draw) {
   RenderContext* context = static_cast<RenderContext*>(draw->pUser);
-  if (context == nullptr || context->display == nullptr ||
-      context->png == nullptr || context->sourceLine == nullptr) {
+  if (context == nullptr || context->png == nullptr ||
+      context->sourceLine == nullptr) {
     return 0;
   }
   const int destinationTop =
@@ -125,6 +87,8 @@ int pngDraw(PNGDRAW* draw) {
 
   context->png->getLineAsRGB565(draw, context->sourceLine,
                                 PNG_RGB565_LITTLE_ENDIAN, 0x00000000UL);
+  if (!context->outputEnabled) return 1;
+  if (context->display == nullptr) return 0;
   for (int destinationX = 0;
        destinationX < context->destinationWidth; ++destinationX) {
     const int sourceX = static_cast<int>(
@@ -155,22 +119,26 @@ void logDecode(Stream* diagnostics, const char* format, ...) {
 }  // namespace
 
 bool initializeSlideshowRenderer(Stream* diagnostics) {
-  if (decoderWorkspace != nullptr) return true;
-  decoderWorkspace = static_cast<DecoderWorkspace*>(
-      heap_caps_malloc(sizeof(DecoderWorkspace), MALLOC_CAP_8BIT));
+  if (decoderWorkspace == nullptr) {
+    decoderWorkspace = static_cast<uint8_t*>(heap_caps_malloc(
+        DECODER_WORKSPACE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
   if (decoderWorkspace == nullptr) {
     logDecode(diagnostics,
-              "[SLS][ERROR] fixed decoder workspace allocation failed: need=%u free=%u largest=%u",
-              static_cast<unsigned>(sizeof(DecoderWorkspace)),
+              "[SLS][ERROR] shared decoder workspace allocation failed: need=%u free=%u largest=%u",
+              static_cast<unsigned>(DECODER_WORKSPACE_BYTES),
               ESP.getFreeHeap(),
-              heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                               MALLOC_CAP_8BIT));
     return false;
   }
   logDecode(diagnostics,
-            "[SLS] decoder workspace allocated once: %u bytes, free=%u largest=%u",
-            static_cast<unsigned>(sizeof(DecoderWorkspace)),
+            "[SLS] shared decoder workspace allocated once: %u bytes, PNG=%u, free=%u largest=%u",
+            static_cast<unsigned>(DECODER_WORKSPACE_BYTES),
+            static_cast<unsigned>(sizeof(PNG)),
             ESP.getFreeHeap(),
-            heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                             MALLOC_CAP_8BIT));
   return true;
 }
 
@@ -202,34 +170,36 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
             "[SLS] decode start: %s bytes=%lu fixedDecoder=%u free=%u largest=%u stackHwm=%u",
             jpeg ? "JPEG" : (png ? "PNG" : "unknown"),
             static_cast<unsigned long>(length),
-            static_cast<unsigned>(jpeg ? sizeof(JPEGDEC) : sizeof(PNG)),
+            static_cast<unsigned>(jpeg ? DECODER_WORKSPACE_BYTES : sizeof(PNG)),
             ESP.getFreeHeap(),
             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
   if (jpeg) {
-    JPEGDEC* decoder = new (&decoderWorkspace->jpeg) JPEGDEC();
-    if (decoder->openRAM(const_cast<uint8_t*>(data), length, jpegDraw)) {
-      const int sourceWidth = decoder->getWidth();
-      const int sourceHeight = decoder->getHeight();
-      if (sourceWidth > 0 && sourceHeight > 0 &&
-          sourceWidth <= SLS_MAX_SOURCE_WIDTH) {
-        fitImage(context, sourceWidth, sourceHeight, x, y, width, height);
-        decoder->setUserPointer(&context);
-        decoder->setPixelType(RGB565_LITTLE_ENDIAN);
-        success = decoder->decode(0, 0, 0) != 0;
-      }
-      if (!success) {
-        logDecode(diagnostics, "[SLS][WARN] JPEG decode failed: error=%d size=%dx%d",
-                  decoder->getLastError(), sourceWidth, sourceHeight);
-      }
-      decoder->close();
-    } else {
-      logDecode(diagnostics, "[SLS][WARN] unsupported or damaged JPEG: error=%d",
-                decoder->getLastError());
+    JPEGImageInfo info;
+    const JPEGPreflightResult preflight =
+        JPEGpreflight(data, length, 160, 128, info);
+    const bool supported =
+        preflight == JPEGPreflightResult::SupportedBaseline ||
+        preflight == JPEGPreflightResult::SupportedProgressive;
+    // Decode the complete entropy stream without touching the display first.
+    // A corrupt or unsupported object therefore leaves the previous pixels
+    // intact. The same bounded workspace is reused for the render pass.
+    if (supported && JPEGvalidate(data, length, 160, 128, decoderWorkspace,
+                                  DECODER_WORKSPACE_BYTES, &info,
+                                  jpegProgress, nullptr)) {
+      JPEGDisplay output(jpegOutput, &display);
+      display.fillScreen(ST77XX_BLACK);
+      success = JPEGdecoder(data, length, output, 160, 128, decoderWorkspace,
+                            DECODER_WORKSPACE_BYTES, &info,
+                            jpegProgress, nullptr);
     }
-    decoder->~JPEGDEC();
+    if (!success) {
+      logDecode(diagnostics, "[SLS][WARN] JPEG rejected: %s size=%ux%u",
+                JPEGpreflightName(preflight), info.width, info.height);
+    }
   } else if (png) {
-    PNG* decoder = new (&decoderWorkspace->png) PNG();
+    // First pass validates every compressed scanline without touching TFT.
+    PNG* decoder = new (decoderWorkspace) PNG();
     if (decoder->openRAM(const_cast<uint8_t*>(data), length, pngDraw) ==
         PNG_SUCCESS) {
       const int sourceWidth = decoder->getWidth();
@@ -238,9 +208,9 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
           sourceWidth <= SLS_MAX_SOURCE_WIDTH) {
         context.sourceLine = pngSourceLine;
         context.png = decoder;
+        context.outputEnabled = false;
         fitImage(context, sourceWidth, sourceHeight, x, y, width, height);
         success = decoder->decode(&context, 0) == PNG_SUCCESS;
-        context.sourceLine = nullptr;
       }
       if (!success) {
         logDecode(diagnostics, "[SLS][WARN] PNG decode failed: error=%d size=%dx%d",
@@ -252,6 +222,20 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
                 decoder->getLastError());
     }
     decoder->~PNG();
+    if (success) {
+      display.fillScreen(ST77XX_BLACK);
+      decoder = new (decoderWorkspace) PNG();
+      success = false;
+      if (decoder->openRAM(const_cast<uint8_t*>(data), length, pngDraw) ==
+          PNG_SUCCESS) {
+        context.png = decoder;
+        context.outputEnabled = true;
+        success = decoder->decode(&context, 0) == PNG_SUCCESS;
+        decoder->close();
+      }
+      decoder->~PNG();
+    }
+    context.sourceLine = nullptr;
   }
 
   logDecode(diagnostics,

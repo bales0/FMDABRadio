@@ -12,8 +12,9 @@
 #include <Adafruit_ST7735.h>
 #include <Arduino.h>
 
-// Allocates one permanent decoder workspace during startup. It is deliberately
-// never released, so repeated slideshow rendering cannot fragment the heap.
+// Allocates one permanent 76,800-byte workspace shared by JPEG and PNG during
+// startup. It is deliberately never released, so repeated slideshow rendering
+// cannot fragment the heap.
 bool initializeSlideshowRenderer(Stream* diagnostics = nullptr);
 
 bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,

@@ -25,8 +25,8 @@ class Backlight {
   static constexpr uint16_t FADE_STEP = 8;
 
   uint8_t _pin = 0xFF;
-  uint16_t _currentDuty = PWM_MAX;
-  uint16_t _targetDuty = PWM_MAX;
+  uint16_t _currentDuty = 0;
+  uint16_t _targetDuty = 0;
   uint32_t _lastActivityMs = 0;
   uint32_t _lastFadeMs = 0;
   uint32_t _dimAfterMs = DIM_AFTER_MS;
