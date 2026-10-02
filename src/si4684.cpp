@@ -5,6 +5,7 @@
  * state transitions, parsing and diagnostic output run from DAB::task().
  */
 #include "si4684.h"
+#include "mot_assembly_policy.h"
 
 #include <SPI.h>
 #include <esp_heap_caps.h>
@@ -91,6 +92,15 @@ constexpr uint8_t RDS_GROUP_2A = 4;
 constexpr uint8_t RDS_GROUP_2B = 5;
 constexpr uint8_t RDS_GROUP_4A = 8;
 
+bool dabLabelHasContent(const char* label) {
+  if (label == nullptr) return false;
+  for (uint8_t index = 0; index < 16U; ++index) {
+    const uint8_t value = static_cast<uint8_t>(label[index]);
+    if (value != 0U && value != static_cast<uint8_t>(' ')) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 DAB::DAB()
@@ -169,6 +179,7 @@ DAB::DAB()
       _signalSampleGeneration(0),
       _timeSampleGeneration(0),
       _fmClockGeneration(0),
+      _dabServiceListGeneration(0),
       _stateDeadlineMs(0),
       _operationDeadlineMs(0),
       _patchOffset(0),
@@ -178,6 +189,8 @@ DAB::DAB()
       _fmSeekSpacing(10),
       _fmDeEmphasis(1),
       _dabTuneTarget(0),
+      _dabTuneBusyRetries(0),
+      _dabTuneRetryNotBeforeMs(0),
       _serviceId(0),
       _componentId(0),
       _activeServiceId(0),
@@ -200,6 +213,9 @@ DAB::DAB()
       _dabEnsembleRefreshPending(false),
       _dabTimeRefreshPending(false),
       _dabAudioRefreshPending(false),
+      _dabAudioInfoValid(false),
+      _dabAudioInfoRetryCount(0),
+      _dabAudioInfoNotBeforeMs(0),
       _dabServiceInfoRefreshPending(false),
       _dabSubchannelRefreshPending(false),
       _dsrvBurstCount(0),
@@ -232,11 +248,13 @@ DAB::DAB()
       _fallbackDataServiceId(0),
       _fallbackDataComponentId(0),
       _slideshowTransportId(0),
+      _slideshowCompletedTransportId(0),
       _slideshowHighestSegment(0),
       _slideshowTotalSegments(0),
       _slideshowExpectedLength(0),
       _slideshowReceivedBytes(0),
       _slideshowImageLength(0),
+      _slideshowLastImageLength(0),
       _slideshowLastActivityMs(0),
       _slideshowServiceId(0),
       _slideshowComponentId(0),
@@ -245,6 +263,8 @@ DAB::DAB()
       _slideshowCollecting(false),
       _slideshowAvailable(false),
       _slideshowUpdate(false),
+      _slideshowPublishedPending(false),
+      _slideshowCompletedTransportValid(false),
       _irqCounter(0),
       _commandErrors(0),
       _dsrvOverflows(0),
@@ -255,7 +275,15 @@ DAB::DAB()
       _lastAudioStatusMs(0),
       _lastMetadataStatusMs(0),
       _lastStatusDiagnosticMs(0),
-      _lastMotSegmentLogMs(0) {
+      _lastMotSegmentLogMs(0),
+      _diagDabHostStarvationCount(0),
+      _diagDabHostStarvationMaxGapUs(0),
+      _diagDabGenuineCtsTimeoutCount(0),
+      _diagDabTuneBusyCount(0),
+      _diagDabAudioNotAvailableCount(0),
+      _diagLastCtsReportMs(0),
+      _diagReportedHostStarvationCount(0),
+      _diagReportedGenuineCtsCount(0) {
   memset(Ensemble, 0, sizeof(Ensemble));
   memset(ServiceData, 0, sizeof(ServiceData));
   memset(ActiveLabel, 0, sizeof(ActiveLabel));
@@ -414,9 +442,15 @@ bool DAB::takeSlideshowUpdate() {
   return value;
 }
 
+void DAB::acknowledgeSlideshow() {
+  _slideshowUpdate = false;
+  _slideshowPublishedPending = false;
+}
+
 void DAB::discardSlideshow() {
   _slideshowAvailable = false;
   _slideshowUpdate = false;
+  _slideshowPublishedPending = false;
   _slideshowImageLength = 0;
 }
 
@@ -533,6 +567,9 @@ bool DAB::requestFmTune(uint16_t frequency10kHz) {
   _rdsPsSeenMask = 0;
   _rdsPsStableMask = 0;
   _lastTextAbState = 0xFF;
+  pi = 0;
+  pty = 0;
+  ECC = 0;
   rdsSync = false;
   tp = false;
   ta = false;
@@ -541,6 +578,7 @@ bool DAB::requestFmTune(uint16_t frequency10kHz) {
   _fmClockValidator.reset();
   fmPilot = false;
   fmStereoBlend = 0;
+  diagnostic("[AF] candidate PI invalidated after tune");
   diagnostic("[RADIO] FM tune start: %u.%02u MHz", frequency10kHz / 100,
              frequency10kHz % 100);
   return startCore(_radio.startFmTune(frequency10kHz), State::FmTuneCommand);
@@ -561,6 +599,9 @@ bool DAB::requestFmSeek(bool up, bool wrap) {
   _rdsPsSeenMask = 0;
   _rdsPsStableMask = 0;
   _lastTextAbState = 0xFF;
+  pi = 0;
+  pty = 0;
+  ECC = 0;
   rdsSync = false;
   tp = false;
   ta = false;
@@ -569,6 +610,7 @@ bool DAB::requestFmSeek(bool up, bool wrap) {
   _fmClockValidator.reset();
   fmPilot = false;
   fmStereoBlend = 0;
+  diagnostic("[AF] candidate PI invalidated after seek");
   diagnostic("[RADIO] FM seek start: direction=%s wrap=%u", up ? "up" : "down",
              wrap ? 1U : 0U);
   return startCore(_radio.startFmSeek(up, wrap), State::FmSeekCommand);
@@ -583,8 +625,25 @@ bool DAB::requestDabTune(uint8_t frequencyIndex) {
   _stateAfterTune = State::Ready;
   _stcPending = false;
   _operationDeadlineMs = millis() + RADIO_TUNE_TIMEOUT_MS;
+  _dabTuneBusyRetries = 0;
+  _dabTuneRetryNotBeforeMs = 0;
+  resetDabAudioInfo();
   numberofservices = 0;
   valid = false;
+  signalstrength = 0;
+  snr = 0;
+  quality = 0;
+  bitrate = 0;
+  samplerate = 0;
+  type = SERVICE_NONE;
+  mode = DUAL;
+  dabplus = false;
+  pty = 0;
+  resetDlsAssembler();
+  resetSlideshowAssembler(true);
+  _slideshowCompletedTransportValid = false;
+  _slideshowLastImageLength = 0U;
+  _slideshowImageHash = 0U;
   diagnostic("[RADIO] DAB tune start: index=%u frequency=%lu kHz", frequencyIndex,
              static_cast<unsigned long>(freq_khz(frequencyIndex)));
   _dabSwitch.requestSwitch();
@@ -620,14 +679,26 @@ bool DAB::requestDabService(uint8_t frequencyIndex, uint32_t serviceId,
   _componentId = componentId;
   _serviceStartRetries = 0;
   _operationDeadlineMs = millis() + RADIO_TUNE_TIMEOUT_MS;
+  _dabTuneBusyRetries = 0;
+  _dabTuneRetryNotBeforeMs = 0;
+  resetDabAudioInfo();
   _stcPending = false;
   memset(ServiceData, 0, sizeof(ServiceData));
   ServiceDataLength = 0;
   ServiceDataCharset = 0;
   memset(ActiveLabel, 0, sizeof(ActiveLabel));
   ActiveCharset = 0;
+  bitrate = 0;
+  samplerate = 0;
+  type = SERVICE_NONE;
+  mode = DUAL;
+  dabplus = false;
+  pty = 0;
   resetDlsAssembler();
   resetSlideshowAssembler(true);
+  _slideshowCompletedTransportValid = false;
+  _slideshowLastImageLength = 0U;
+  _slideshowImageHash = 0U;
   diagnostic("[RADIO] DAB service request: index=%u SID=0x%08lX CID=0x%08lX",
              frequencyIndex, static_cast<unsigned long>(serviceId),
              static_cast<unsigned long>(componentId));
@@ -709,7 +780,24 @@ void DAB::task() {
     diagnostic("[SLS][WARN] collection timeout: object=%06lX bytes=%lu",
                static_cast<unsigned long>(_slideshowTransportId),
                static_cast<unsigned long>(_slideshowReceivedBytes));
-    resetSlideshowAssembler(true);
+    resetSlideshowAssembler(false);
+  }
+
+  const uint32_t now = millis();
+  const bool ctsCountersChanged =
+      _diagReportedHostStarvationCount != _diagDabHostStarvationCount ||
+      _diagReportedGenuineCtsCount != _diagDabGenuineCtsTimeoutCount;
+  if (ctsCountersChanged &&
+      (_diagLastCtsReportMs == 0U ||
+       static_cast<uint32_t>(now - _diagLastCtsReportMs) >= 5000U)) {
+    _diagLastCtsReportMs = now;
+    _diagReportedHostStarvationCount = _diagDabHostStarvationCount;
+    _diagReportedGenuineCtsCount = _diagDabGenuineCtsTimeoutCount;
+    diagnostic("[DAB/CTS] hostStarved=%lu maxGap=%luus genuine=%lu consecutive=%u",
+               static_cast<unsigned long>(_diagDabHostStarvationCount),
+               static_cast<unsigned long>(_diagDabHostStarvationMaxGapUs),
+               static_cast<unsigned long>(_diagDabGenuineCtsTimeoutCount),
+               _consecutiveCtsTimeouts);
   }
 }
 
@@ -766,9 +854,11 @@ const char* DAB::stateName() const {
     case State::FmSeekCommand: return "fm-seek-command";
     case State::FmSeekWaitStc: return "fm-seek-stc";
     case State::DabTuneCommand: return "dab-tune-command";
+    case State::DabTuneRetry: return "dab-tune-retry";
     case State::DabTuneWaitStc: return "dab-tune-stc";
     case State::DabStopDataServiceCommand: return "dab-stop-data";
     case State::DabStopServiceCommand: return "dab-stop-service";
+    case State::DabStopRetry: return "dab-stop-retry";
     case State::DabServiceSettle: return "dab-service-settle";
     case State::DabServiceCommand: return "dab-service";
     case State::DabServiceRetry: return "dab-service-retry";
@@ -845,6 +935,9 @@ uint32_t DAB::signalSampleGeneration() const {
 }
 uint32_t DAB::timeSampleGeneration() const { return _timeSampleGeneration; }
 uint32_t DAB::fmClockGeneration() const { return _fmClockGeneration; }
+uint32_t DAB::dabServiceListGeneration() const {
+  return _dabServiceListGeneration;
+}
 const fm_features::AfList& DAB::fmAfList() const { return _fmAfList; }
 
 bool DAB::writeCommand(void* context, uint8_t command, const uint8_t* args,
@@ -1071,11 +1164,28 @@ void DAB::advanceState() {
       }
       break;
 
+    case State::DabTuneRetry:
+      if (deadlineReached(now, _dabTuneRetryNotBeforeMs)) {
+        startCore(_radio.startDabTune(_dabTuneTarget), State::DabTuneCommand);
+      }
+      break;
+
     case State::DabServiceRetry:
       if (deadlineReached(now, _operationDeadlineMs)) {
         fail(si468x::Result::Timeout, "START_DIGITAL_SERVICE retries");
       } else if (deadlineReached(now, _stateDeadlineMs)) {
         startDabServiceCommand();
+      }
+      break;
+
+    case State::DabStopRetry:
+      if (deadlineReached(now, _dabSwitch.notBeforeMs)) {
+        if (_dabSwitch.resume == dab_switch::Resume::StopData)
+          startDabStopDataCommand();
+        else if (_dabSwitch.resume == dab_switch::Resume::StopAudio)
+          startDabStopCommand();
+        else
+          _state = State::Ready;
       }
       break;
 
@@ -1121,12 +1231,25 @@ void DAB::commandCompleted() {
       _state == State::DabTimeCommand || _state == State::DabAudioCommand ||
       _state == State::DabServiceInfoCommand ||
       _state == State::DabSubchannelCommand;
-  if (result == si468x::Result::Timeout) {
-    if (_consecutiveCtsTimeouts < 0xFFU) ++_consecutiveCtsTimeouts;
+  const dab_scheduler::CtsTimeoutClass ctsClass =
+      dab_scheduler::classifyCtsTimeout(
+          result == si468x::Result::Timeout,
+          _band == 0U ? _radio.lastServiceGapUs() : 0U);
+  if (ctsClass == dab_scheduler::CtsTimeoutClass::HostStarved) {
+    ++_diagDabHostStarvationCount;
+    if (_radio.lastServiceGapUs() > _diagDabHostStarvationMaxGapUs)
+      _diagDabHostStarvationMaxGapUs = _radio.lastServiceGapUs();
+    _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
+        ctsClass, _consecutiveCtsTimeouts);
+  } else if (ctsClass == dab_scheduler::CtsTimeoutClass::Genuine) {
+    ++_diagDabGenuineCtsTimeoutCount;
+    _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
+        ctsClass, _consecutiveCtsTimeouts);
   } else {
-    _consecutiveCtsTimeouts = 0;
+    _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
+        ctsClass, _consecutiveCtsTimeouts);
   }
-  if (_consecutiveCtsTimeouts >= 3U &&
+  if (dab_scheduler::ctsRecoveryRequired(_consecutiveCtsTimeouts) &&
       (_lastRecoveryMs == 0U ||
        static_cast<uint32_t>(millis() - _lastRecoveryMs) >= 30000UL)) {
     _lastRecoveryMs = millis();
@@ -1145,20 +1268,107 @@ void DAB::commandCompleted() {
     return;
   }
   if (result != si468x::Result::Ok) {
+    const uint8_t deviceReason = _radio.lastDeviceError();
+    if (_state == State::DabTuneCommand &&
+        result == si468x::Result::DeviceError && deviceReason == 0x18U) {
+      ++_diagDabTuneBusyCount;
+      if (_dabTuneBusyRetries < dab_scheduler::DAB_TUNE_BUSY_MAX_RETRIES) {
+        ++_dabTuneBusyRetries;
+        _dabTuneRetryNotBeforeMs = millis() +
+            dab_scheduler::DAB_TUNE_BUSY_BACKOFF_MS * _dabTuneBusyRetries;
+        _state = State::DabTuneRetry;
+        diagnostic("[DAB/TUNE] busy index=%u retry=%u/%u",
+                   _dabTuneTarget, _dabTuneBusyRetries,
+                   dab_scheduler::DAB_TUNE_BUSY_MAX_RETRIES);
+      } else {
+        ++_commandErrors;
+        diagnostic("[DAB/TUNE] busy retries exhausted index=%u; request failed",
+                   _dabTuneTarget);
+        finishOperation(false);
+      }
+      return;
+    }
+    if (_state == State::DabAudioCommand &&
+        result == si468x::Result::DeviceError && deviceReason == 0x03U) {
+      ++_diagDabAudioNotAvailableCount;
+      _dabAudioInfoValid = false;
+      _state = State::Ready;
+      const uint32_t now = millis();
+      if (_dabAudioInfoRetryCount <
+          dab_scheduler::DAB_AUDIO_INFO_FAST_RETRIES) {
+        ++_dabAudioInfoRetryCount;
+        const uint32_t delayMs = dab_scheduler::audioInfoRetryDelayMs(
+            _dabAudioInfoRetryCount);
+        _dabAudioInfoNotBeforeMs = now + delayMs;
+        _dabAudioRefreshPending = true;
+        diagnostic("[DAB/AUDIO] NOT_AVAILABLE retry=%u next=%lums",
+                   _dabAudioInfoRetryCount,
+                   static_cast<unsigned long>(delayMs));
+      } else {
+        _dabAudioInfoRetryCount = 0;
+        _dabAudioRefreshPending = false;
+        _dabAudioInfoNotBeforeMs =
+            now + dab_scheduler::DAB_AUDIO_INFO_SLOW_RETRY_MS;
+        _dabAudioNextDueMs = _dabAudioInfoNotBeforeMs;
+        diagnostic("[DAB/AUDIO] NOT_AVAILABLE deferred to normal interval");
+      }
+      return;
+    }
     if (_state == State::DabStopDataServiceCommand) {
       ++_commandErrors;
-      diagnostic("[RADIO][WARN] STOP data service: %s device=0x%02X; continuing transition",
-                 resultName(result), _radio.lastDeviceError());
-      _activeDataServiceValid = false;
-      _dataServiceStopPending = false;
-      if (_serviceTransitionPending && _activeServiceValid) {
-        startDabStopCommand();
-      } else if (_serviceTransitionPending) {
+      const bool alreadyStopped = result == si468x::Result::DeviceError &&
+                                  deviceReason == 0x03U;
+      if (alreadyStopped) {
+        diagnostic("[DAB/SWITCH] data STOP already inactive; continuing");
+        _activeDataServiceValid = false;
+        _dataServiceStopPending = false;
+        _dabSwitch.stopRetries = 0U;
+        if (_serviceTransitionPending && _activeServiceValid) {
+          startDabStopCommand();
+        } else if (_serviceTransitionPending) {
+          _serviceTransitionPending = false;
+          _state = State::DabServiceSettle;
+          _stateDeadlineMs = millis() + dab_switch::STOP_SETTLE_MS;
+        } else {
+          _state = State::Ready;
+        }
+      } else if (_dabSwitch.backoff(
+                     dab_switch::Resume::StopData,
+                     _dabSwitch.stopRetries,
+                     dab_switch::MAX_STOP_RETRIES, millis())) {
+        _state = State::DabStopRetry;
+        diagnostic("[DAB/SWITCH] data STOP retry=%u/%u result=%s",
+                   _dabSwitch.stopRetries, dab_switch::MAX_STOP_RETRIES,
+                   resultName(result));
+      } else {
+        diagnostic("[DAB/SWITCH] data STOP retries exhausted; new stream not started");
+        finishOperation(false);
+      }
+      return;
+    }
+    if (_state == State::DabStopServiceCommand) {
+      ++_commandErrors;
+      const bool alreadyStopped = result == si468x::Result::DeviceError &&
+                                  deviceReason == 0x03U;
+      if (alreadyStopped) {
+        diagnostic("[DAB/SWITCH] audio STOP already inactive; continuing");
+        _activeServiceValid = false;
+        resetDabAudioInfo();
+        _dabSwitch.stopRetries = 0U;
         _serviceTransitionPending = false;
         _state = State::DabServiceSettle;
         _stateDeadlineMs = millis() + dab_switch::STOP_SETTLE_MS;
+      } else if (_dabSwitch.backoff(
+                     dab_switch::Resume::StopAudio,
+                     _dabSwitch.stopRetries,
+                     dab_switch::MAX_STOP_RETRIES, millis())) {
+        _state = State::DabStopRetry;
+        diagnostic("[DAB/SWITCH] audio STOP retry=%u/%u result=%s",
+                   _dabSwitch.stopRetries, dab_switch::MAX_STOP_RETRIES,
+                   resultName(result));
       } else {
-        _state = State::Ready;
+        diagnostic("[DAB/SWITCH] audio STOP retries exhausted; new stream not started");
+        finishOperation(false);
       }
       return;
     }
@@ -1347,6 +1557,8 @@ void DAB::commandCompleted() {
       break;
 
     case State::DabTuneCommand:
+      _dabTuneBusyRetries = 0;
+      _dabTuneRetryNotBeforeMs = 0;
       _state = State::DabTuneWaitStc;
       break;
 
@@ -1356,6 +1568,7 @@ void DAB::commandCompleted() {
                  static_cast<unsigned long>(_activeDataComponentId));
       _activeDataServiceValid = false;
       _dataServiceStopPending = false;
+      _dabSwitch.stopRetries = 0U;
       if (_serviceTransitionPending && _activeServiceValid) {
         startDabStopCommand();
       } else if (_serviceTransitionPending) {
@@ -1372,6 +1585,8 @@ void DAB::commandCompleted() {
                  static_cast<unsigned long>(_activeServiceId),
                  static_cast<unsigned long>(_activeComponentId));
       _activeServiceValid = false;
+      resetDabAudioInfo();
+      _dabSwitch.stopRetries = 0U;
       _serviceTransitionPending = false;
       _state = State::DabServiceSettle;
       _stateDeadlineMs = millis() + dab_switch::STOP_SETTLE_MS;
@@ -1389,6 +1604,9 @@ void DAB::commandCompleted() {
         // the documented 2/5/8/15/30 s phases from this point.
         const bool serviceListPending = _dabServiceListRefreshPending;
         resetPeriodicDeadlines(millis());
+        resetDabAudioInfo(millis() +
+                          dab_scheduler::DAB_AUDIO_INFO_INITIAL_DELAY_MS);
+        _dabAudioRefreshPending = true;
         _dabServiceListRefreshPending = serviceListPending;
         _dataServiceRetryNotBeforeMs =
             millis() + dab_switch::AUDIO_TO_DATA_SETTLE_MS;
@@ -1530,6 +1748,12 @@ void DAB::commandCompleted() {
         bitrate = value.bitRateKbps;
         samplerate = value.sampleRateHz;
         mode = static_cast<AudioMode>(value.audioMode & 0x03U);
+        _dabAudioInfoValid = true;
+        _dabAudioInfoRetryCount = 0;
+        _dabAudioInfoNotBeforeMs = 0;
+        _dabAudioNextDueMs = millis() + dab_scheduler::DAB_AUDIO_INTERVAL_MS;
+        diagnostic("[DAB/AUDIO] info ready bitrate=%u samplerate=%u mode=%u",
+                   bitrate, samplerate, static_cast<unsigned>(mode));
       } else ++_commandErrors;
       _state = State::Ready;
       break;
@@ -1581,6 +1805,7 @@ void DAB::startDabServiceCommand() {
   si468x::writeLe32(args + 3, _serviceId);
   si468x::writeLe32(args + 7, _componentId);
   _dabSwitch.bindCommand();
+  _dabSwitch.state = dab_switch::State::WaitAudioStart;
   startRaw(si468x::Command::START_DIGITAL_SERVICE, args, sizeof(args),
            State::DabServiceCommand);
 }
@@ -1591,6 +1816,7 @@ void DAB::startDabDataServiceCommand() {
   si468x::writeLe32(args + 7, _dataComponentId);
   _dataServicePending = false;
   _dabSwitch.bindCommand();
+  _dabSwitch.state = dab_switch::State::WaitDataStart;
   startRaw(si468x::Command::START_DIGITAL_SERVICE, args, sizeof(args),
            State::DabDataServiceCommand);
 }
@@ -1600,6 +1826,7 @@ void DAB::startDabStopDataCommand() {
   si468x::writeLe32(args + 3, _activeDataServiceId);
   si468x::writeLe32(args + 7, _activeDataComponentId);
   _dabSwitch.bindCommand();
+  _dabSwitch.state = dab_switch::State::WaitDataStop;
   startRaw(si468x::Command::STOP_DIGITAL_SERVICE, args, sizeof(args),
            State::DabStopDataServiceCommand);
 }
@@ -1609,6 +1836,7 @@ void DAB::startDabStopCommand() {
   si468x::writeLe32(args + 3, _activeServiceId);
   si468x::writeLe32(args + 7, _activeComponentId);
   _dabSwitch.bindCommand();
+  _dabSwitch.state = dab_switch::State::WaitAudioStop;
   startRaw(si468x::Command::STOP_DIGITAL_SERVICE, args, sizeof(args),
            State::DabStopServiceCommand);
 }
@@ -1795,6 +2023,16 @@ void DAB::resetPeriodicDeadlines(uint32_t now) {
   _lastLowPriorityCommandMs = now - dab_scheduler::DAB_LOW_PRIORITY_GAP_MS;
 }
 
+void DAB::resetDabAudioInfo(uint32_t notBeforeMs) {
+  _dabAudioInfoValid = false;
+  _dabAudioInfoRetryCount = 0;
+  _dabAudioInfoNotBeforeMs = notBeforeMs;
+  _dabAudioRefreshPending = false;
+  bitrate = 0;
+  samplerate = 0;
+  mode = DUAL;
+}
+
 void DAB::updatePeriodicRequests(uint32_t now) {
   if (_band != 0) return;
   if (dab_scheduler::takePeriodicDeadline(
@@ -1891,7 +2129,9 @@ void DAB::scheduleReadyWork(uint32_t now) {
        (valid && (_dabServiceListRefreshPending ||
                   _dabEnsembleRefreshPending || _dabTimeRefreshPending)) ||
        (valid && _activeServiceValid &&
-        (_dabAudioRefreshPending || _dabServiceInfoRefreshPending ||
+        ((_dabAudioRefreshPending &&
+          dab_scheduler::retryReady(now, _dabAudioInfoNotBeforeMs)) ||
+         _dabServiceInfoRefreshPending ||
          _dabSubchannelRefreshPending)));
   const dab_scheduler::BackgroundWork work =
       dab_scheduler::chooseBackgroundWork(
@@ -1937,7 +2177,8 @@ void DAB::scheduleReadyWork(uint32_t now) {
     startRaw(si468x::Command::DAB_GET_TIME, &zero, 1,
              State::DabTimeCommand, 100000UL, 11);
   } else if (valid && _activeServiceValid &&
-             _dabAudioRefreshPending && _serviceId != 0) {
+             _dabAudioRefreshPending && _serviceId != 0 &&
+             dab_scheduler::retryReady(now, _dabAudioInfoNotBeforeMs)) {
     _dabAudioRefreshPending = false;
     startRaw(si468x::Command::DAB_GET_AUDIO_INFO, &zero, 1,
              State::DabAudioCommand, 100000UL, 10);
@@ -2241,6 +2482,7 @@ void DAB::resetSlideshowAssembler(bool clearImage) {
     _slideshowImageLength = 0;
     _slideshowAvailable = false;
     _slideshowUpdate = false;
+    _slideshowPublishedPending = false;
   }
 }
 
@@ -2263,7 +2505,8 @@ bool DAB::storeSlideshowSegment(uint16_t segment, const uint8_t* data,
                                         uint16_t dataLength) {
   if (segment >= SLS_MAX_SEGMENTS || data == nullptr || dataLength == 0U ||
       dataLength > SLS_MAX_SEGMENT_BYTES ||
-      _slideshowReceivedBytes > DAB_SLS_ARENA_BYTES - dataLength) {
+      !mot_assembly::canAppend(_slideshowReceivedBytes, dataLength,
+                               DAB_SLS_ARENA_BYTES)) {
     return false;
   }
 
@@ -2296,6 +2539,11 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
       (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
   const bool last = (segmentField & 0x8000U) != 0U;
   const uint16_t segment = segmentField & 0x7FFFU;
+  if (!mot_assembly::segmentInRange(segment, SLS_MAX_SEGMENTS)) {
+    diagnostic("[SLS][WARN] invalid segment index=%u max=%u", segment,
+               SLS_MAX_SEGMENTS - 1U);
+    return;
+  }
   const uint32_t objectId = (static_cast<uint32_t>(payload[4]) << 16) |
                             (static_cast<uint32_t>(payload[5]) << 8) |
                             payload[6];
@@ -2308,20 +2556,57 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
                packetType, length, static_cast<unsigned long>(requiredLength));
     return;
   }
+  const uint8_t* data = payload + 9;
   if (packetType == 0x73U) {
-    diagnostic("[SLS] header object=%06lX segment=%u%s bytes=%u",
+    uint32_t bodySize = 0;
+    uint16_t headerSize = 0;
+    const bool validHeader = segment == 0U &&
+        mot_assembly::decodeHeaderCore(data, dataLength, bodySize, headerSize) &&
+        bodySize <= DAB_SLS_ARENA_BYTES;
+    diagnostic("[SLS] header object=%06lX segment=%u%s bytes=%u body=%lu header=%u",
                static_cast<unsigned long>(objectId), segment,
-               last ? " LAST" : "", dataLength);
+               last ? " LAST" : "", dataLength,
+               static_cast<unsigned long>(validHeader ? bodySize : 0U),
+               validHeader ? headerSize : 0U);
+    if (!validHeader || !mot_assembly::canAcceptTransport(
+            _slideshowPublishedPending, _slideshowCompletedTransportValid,
+            _slideshowCompletedTransportId, objectId)) return;
+
+    if (!_slideshowCollecting || _slideshowTransportId != objectId ||
+        (_slideshowExpectedLength != 0U &&
+         _slideshowExpectedLength != bodySize)) {
+      // Header metadata alone must not evict the cached image. The arena is
+      // reused only when the first valid body segment is accepted below.
+      resetSlideshowAssembler(false);
+      _slideshowCollecting = true;
+      _slideshowTransportId = objectId;
+      _slideshowServiceId = header.serviceId;
+      _slideshowComponentId = header.componentId;
+    }
+    _slideshowExpectedLength = bodySize;
+    _slideshowLastActivityMs = millis();
     return;
   }
-  const uint8_t* data = payload + 9;
 
   if (dataLength == 0U || dataLength > SLS_MAX_SEGMENT_BYTES) {
     diagnostic("[SLS][WARN] segment dropped: index=%u length=%u max=%u",
                segment, dataLength, SLS_MAX_SEGMENT_BYTES);
     return;
   }
-  if (_slideshowAvailable) return;
+  if (!mot_assembly::canAcceptTransport(
+          _slideshowPublishedPending, _slideshowCompletedTransportValid,
+          _slideshowCompletedTransportId, objectId)) return;
+
+  // Keep the last complete image available for reopening until a valid first
+  // body segment of a different MOT object actually arrives. From this point
+  // the single arena belongs to the new collector and the cached image can no
+  // longer be decoded safely.
+  if (_slideshowAvailable) {
+    if (!mot_assembly::startsNewBodyOverCache(true, segment)) return;
+    _slideshowAvailable = false;
+    _slideshowUpdate = false;
+    _slideshowImageLength = 0U;
+  }
 
   if (!_slideshowCollecting) {
     resetSlideshowAssembler(true);
@@ -2330,7 +2615,8 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
     _slideshowServiceId = header.serviceId;
     _slideshowComponentId = header.componentId;
   } else if (_slideshowTransportId != objectId) {
-    if (segment != 0U) return;
+    if (!mot_assembly::objectPacketBelongs(
+            true, _slideshowTransportId, objectId, segment)) return;
     diagnostic("[SLS] switching object %06lX -> %06lX at segment 0",
                static_cast<unsigned long>(_slideshowTransportId),
                static_cast<unsigned long>(objectId));
@@ -2346,12 +2632,26 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
   if ((bitmapByte & mask) != 0U) {
     // Some broadcasters omit LAST. Repeated segment zero marks the next
     // carousel cycle, so a contiguous object collected before it is complete.
-    if (segment == 0U && _slideshowTotalSegments == 0U &&
+    const bool precedingSegmentsComplete =
         _slideshowHighestSegment > 0U &&
-        allSlideshowSegmentsReceived(_slideshowHighestSegment + 1U)) {
+        allSlideshowSegmentsReceived(_slideshowHighestSegment + 1U);
+    if (mot_assembly::repeatedZeroCompletes(
+            true, segment, _slideshowTotalSegments,
+            _slideshowHighestSegment, precedingSegmentsComplete)) {
       _slideshowTotalSegments = _slideshowHighestSegment + 1U;
       finishSlideshowObject();
     }
+    return;
+  }
+  if (_slideshowExpectedLength != 0U &&
+      (_slideshowReceivedBytes > _slideshowExpectedLength ||
+       static_cast<uint32_t>(dataLength) >
+           _slideshowExpectedLength - _slideshowReceivedBytes)) {
+    diagnostic("[SLS][WARN] body exceeds header size object=%06lX received=%lu add=%u expected=%lu",
+               static_cast<unsigned long>(objectId),
+               static_cast<unsigned long>(_slideshowReceivedBytes), dataLength,
+               static_cast<unsigned long>(_slideshowExpectedLength));
+    resetSlideshowAssembler(true);
     return;
   }
   if (!storeSlideshowSegment(segment, data, dataLength)) {
@@ -2364,7 +2664,9 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
   bitmapByte |= mask;
   _slideshowReceivedBytes += dataLength;
   if (segment > _slideshowHighestSegment) _slideshowHighestSegment = segment;
-  if (last) _slideshowTotalSegments = static_cast<uint16_t>(segment) + 1U;
+  const uint16_t totalFromLast =
+      mot_assembly::totalSegmentsFromLast(segment, last);
+  if (totalFromLast != 0U) _slideshowTotalSegments = totalFromLast;
   _slideshowLastActivityMs = millis();
 
   if (dab_scheduler::shouldLogMotSegment(
@@ -2376,7 +2678,9 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
   }
 
   if (_slideshowTotalSegments != 0U &&
-      allSlideshowSegmentsReceived(_slideshowTotalSegments)) {
+      allSlideshowSegmentsReceived(_slideshowTotalSegments) &&
+      (_slideshowExpectedLength == 0U ||
+       _slideshowReceivedBytes == _slideshowExpectedLength)) {
     finishSlideshowObject();
   }
 }
@@ -2386,6 +2690,8 @@ void DAB::finishSlideshowObject() {
                              ? _slideshowTotalSegments
                              : _slideshowHighestSegment + 1;
   if (!allSlideshowSegmentsReceived(count)) return;
+  if (_slideshowExpectedLength != 0U &&
+      _slideshowReceivedBytes != _slideshowExpectedLength) return;
 
   // Segments are already packed in ascending SegmentNumber order.  Validate
   // the metadata and publish the contiguous arena directly; no second assembly
@@ -2456,18 +2762,24 @@ void DAB::finishSlideshowObject() {
   for (uint32_t index = 0; index < outputLength; ++index) {
     hash = (hash ^ _slideshowArena[index]) * 16777619UL;
   }
-  const bool changed = !_slideshowAvailable ||
-                       outputLength != _slideshowImageLength ||
+  const bool changed = outputLength != _slideshowLastImageLength ||
                        hash != _slideshowImageHash;
+  _slideshowLastImageLength = outputLength;
+  // Even when a broadcaster rotates the identical artwork under a new
+  // Transport ID, the freshly assembled bytes remain a valid cache for a
+  // later SELECT reopen. Only the UI update notification is deduplicated.
   _slideshowImageLength = outputLength;
   _slideshowImageHash = hash;
+  _slideshowCompletedTransportId = _slideshowTransportId;
+  _slideshowCompletedTransportValid = true;
   _slideshowAvailable = true;
-  _slideshowUpdate |= changed;
+  _slideshowUpdate = changed;
+  _slideshowPublishedPending = changed;
   diagnostic("[SLS] %s ready: %lu bytes, %u segments, imageOffset=%lu free=%u largest=%u%s",
              jpeg ? "JPEG" : "PNG", static_cast<unsigned long>(outputLength),
              count, static_cast<unsigned long>(imageOffset), ESP.getFreeHeap(),
              heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-             changed ? "" : " (unchanged)");
+             changed ? "" : " (unchanged, not republished)");
   resetSlideshowAssembler(false);
 }
 
@@ -2508,6 +2820,13 @@ void DAB::processServiceListReply() {
     return;
   }
 
+  const uint8_t previousServiceCount = numberofservices;
+  DABService previousServices[DAB_MAX_SERVICES];
+  if (previousServiceCount != 0U) {
+    memcpy(previousServices, service,
+           static_cast<size_t>(previousServiceCount) * sizeof(DABService));
+  }
+
   si468x::DabServiceListSink sink;
   sink.context = this;
   sink.onHeader = serviceListHeader;
@@ -2524,6 +2843,27 @@ void DAB::processServiceListReply() {
     numberofservices = 0;
     diagnostic("[RADIO][WARN] malformed DAB service list");
     return;
+  }
+
+  _dabServiceListGeneration =
+      dab_scheduler::nextGeneration(_dabServiceListGeneration);
+
+  // Some ensembles briefly publish zero-filled labels while rebuilding the
+  // same service list. Keep a previously received real label for the same
+  // SID/COMP_ID instead of regressing it to the scan fallback name.
+  for (uint8_t current = 0; current < numberofservices; ++current) {
+    if (dabLabelHasContent(service[current].Label)) continue;
+    for (uint8_t previous = 0; previous < previousServiceCount; ++previous) {
+      if (previousServices[previous].ServiceID != service[current].ServiceID ||
+          previousServices[previous].CompID != service[current].CompID ||
+          !dabLabelHasContent(previousServices[previous].Label)) continue;
+      memcpy(service[current].Label, previousServices[previous].Label, 17U);
+      service[current].Charset = previousServices[previous].Charset;
+      diagnostic("[RADIO] retained label SID=%08lX CID=%08lX from previous generation",
+                 static_cast<unsigned long>(service[current].ServiceID),
+                 static_cast<unsigned long>(service[current].CompID));
+      break;
+    }
   }
 
   // If this list already contains the currently requested service, publish
@@ -2559,7 +2899,9 @@ void DAB::processServiceListReply() {
     if (_dabSwitch.slsContextValid) _dabSwitch.state = dab_switch::State::Ready;
   }
 
-  diagnostic("[RADIO] service list: %u services", numberofservices);
+  diagnostic("[RADIO] service list: generation=%lu services=%u",
+             static_cast<unsigned long>(_dabServiceListGeneration),
+             numberofservices);
   for (uint8_t i = 0; i < numberofservices; ++i) {
     if (i < 4 || service[i].Type != SERVICE_AUDIO) {
       diagnostic("[RADIO] svc[%u] SID=%08lX CID=%08lX type=%u charset=%u label=%02X %02X %02X %02X",
@@ -2623,6 +2965,7 @@ void DAB::processDabStatusReply(bool acknowledgeStc) {
     ++_commandErrors;
     return;
   }
+  const bool wasValid = valid;
   freq_index = grade.tuneIndex;
   signalstrength = grade.rssi;
   snr = static_cast<int8_t>(grade.cnr);
@@ -2631,7 +2974,7 @@ void DAB::processDabStatusReply(bool acknowledgeStc) {
   _signalSampleGeneration =
       dab_scheduler::nextGeneration(_signalSampleGeneration);
   error = 0;
-  if (valid && acknowledgeStc) {
+  if (valid && (acknowledgeStc || !wasValid)) {
     _dabServiceListRefreshPending = true;
   }
   const uint32_t now = millis();

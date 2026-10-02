@@ -33,6 +33,21 @@ inline bool sweepExpired(uint32_t now, uint32_t deadline) {
   return static_cast<int32_t>(now - deadline) >= 0;
 }
 
+inline bool automaticProbeAllowed(bool fmBand, bool enabled, bool scanning,
+                                  bool bandStarting, bool listeningView,
+                                  bool stationPreview) {
+  return fmBand && enabled && !scanning && !bandStarting && listeningView &&
+         !stationPreview;
+}
+
+inline bool shouldDeferUserEvent(bool probeActive, bool eventPending) {
+  return probeActive && !eventPending;
+}
+
+inline bool canResumeUserEvent(bool probeActive, bool bandStarting) {
+  return !probeActive && !bandStarting;
+}
+
 }  // namespace fm_af
 
 #endif

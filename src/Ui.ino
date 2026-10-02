@@ -799,10 +799,14 @@ void renderUiStatusStatic() {
   char value[32];
   if (dabMode == 1) {
     static const char* const shortAudioMode[] = {"DUAL", "MONO", "ST", "J-ST"};
-    snprintf(value, sizeof(value), "%s %ukbit %ukHz %s",
-             Dab.dabplus ? "HE-AAC" : "MP2", Dab.bitrate,
-             Dab.samplerate / 1000U,
-             shortAudioMode[static_cast<uint8_t>(Dab.mode) & 0x03U]);
+    if (Dab.bitrate == 0U || Dab.samplerate == 0U) {
+      snprintf(value, sizeof(value), "Audio loading...");
+    } else {
+      snprintf(value, sizeof(value), "%s %ukbit %ukHz %s",
+               Dab.dabplus ? "HE-AAC" : "MP2", Dab.bitrate,
+               Dab.samplerate / 1000U,
+               shortAudioMode[static_cast<uint8_t>(Dab.mode) & 0x03U]);
+    }
     drawUtf8Text(String(value), 2, 83, ST77XX_WHITE, 1, 156);
     drawUtf8Text("RX", 2, 113, Dab.valid ? ST77XX_GREEN : ST77XX_RED, 1, 12);
     drawUtf8Text("FIC", 20, 113, ST77XX_CYAN, 1, 18);
@@ -916,7 +920,7 @@ bool renderSlideshowScreen() {
   const int16_t imageHeight = uiSettings.slideshowLayout ? screenHeight : 112;
   const bool decoded = renderRamSlideshow(
       tft, Dab.slideshowData(), Dab.slideshowLength(), 0, 0,
-      screenWidth, imageHeight, &Serial);
+      screenWidth, imageHeight, &serialMonitor);
   uiSlideshowDecodePending = false;
   if (!decoded) {
     // The decoder validates before its first pixel write. Keep the last valid
@@ -926,9 +930,11 @@ bool renderSlideshowScreen() {
     return false;
   }
   renderSlideshowStatus();
-  // Pixels are now stored in the display controller. Reuse the one compressed
-  // MOT arena for the next object instead of allocating another image buffer.
-  Dab.discardSlideshow();
+  // Keep the complete compressed object available so leaving and reopening
+  // the slideshow redraws the same image immediately. acknowledgeSlideshow()
+  // only releases collector ownership; the first segment of a genuinely new
+  // Transport ID will invalidate and reuse the single arena.
+  Dab.acknowledgeSlideshow();
   return true;
 }
 
@@ -1219,7 +1225,7 @@ void openStationList() {
                                          total - UI_LIST_ROWS + 1U)
                          : 1U;
   }
-  Serial.printf("[UI] station list open: band=%s total=%u selected=%u free=%u min=%u largest=%u stackHwm=%u\n",
+  serialMonitor.printf("[UI] station list open: band=%s total=%u selected=%u free=%u min=%u largest=%u stackHwm=%u\n",
                 dabMode == 1 ? "DAB" : "FM", total, stationListSelection,
                 ESP.getFreeHeap(),
                 heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
@@ -1517,7 +1523,7 @@ void serviceUi(uint32_t now) {
       if (canDefaultOpen) uiDefaultSlideshowPending = false;
       if (canAutoOpen || canDefaultOpen) uiView = UiView::Slideshow;
       uiSlideshowDecodePending = false;
-      Serial.printf("[SLS/UI] rendering %lu bytes\n",
+      serialMonitor.printf("[SLS/UI] rendering %lu bytes\n",
                     static_cast<unsigned long>(Dab.slideshowLength()));
       const bool rendered = renderSlideshowScreen();
       if (!rendered && canAutoOpen) {
@@ -1526,7 +1532,9 @@ void serviceUi(uint32_t now) {
       }
     } else {
       // Manual mode keeps the compressed image ready in RAM and decodes only
-      // when the user actually opens the SLS screen.
+      // when the user actually opens the SLS screen. Release exclusive UI
+      // ownership while retaining the cached image for SELECT.
+      Dab.acknowledgeSlideshow();
       uiSlideshowDecodePending = false;
     }
   }

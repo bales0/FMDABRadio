@@ -57,13 +57,13 @@ void startEEPROM(){
    if (extEEPROM.begin() == false) 
   {
     Message_red("No memory detected",97);
-    Serial.println("[EEPROM][FATAL] external EEPROM not detected; radio halted");
+    serialMonitor.println("[EEPROM][FATAL] external EEPROM not detected; radio halted");
     while (true) delay(1000);
   }
   extEEPROM.setMemorySize(256000 / 8); //EEPROM is the 24256C (256k bit)
-  Serial.print("Mem size in bytes: ");
-  Serial.println(extEEPROM.length());
-  Serial.println();
+  serialMonitor.print("Mem size in bytes: ");
+  serialMonitor.println(extEEPROM.length());
+  serialMonitor.println();
 }
 
 void cleanEEPROM() {
@@ -115,12 +115,12 @@ void lastEEPROM(){                                               // read back : 
     extEEPROM.get(ADDR_TOTAL_FM_CHANNEL, totalFMchannels); 
 
     if (totalDABchannels > MAX_DAB_STATIONS) {
-      Serial.printf("[EEPROM][WARN] invalid DAB station count %u; list disabled\n",
+      serialMonitor.printf("[EEPROM][WARN] invalid DAB station count %u; list disabled\n",
                     totalDABchannels);
       totalDABchannels = 0;
     }
     if (totalFMchannels > MAX_FM_STATIONS) {
-      Serial.printf("[EEPROM][WARN] invalid FM station count %u; list disabled\n",
+      serialMonitor.printf("[EEPROM][WARN] invalid FM station count %u; list disabled\n",
                     totalFMchannels);
       totalFMchannels = 0;
     }
@@ -155,7 +155,7 @@ void lastEEPROM(){                                               // read back : 
       // untouched by this one-time settings migration.
       extEEPROM.put(ADDR_VOLUME, vol);
       writeSettingsSchema();
-      Serial.printf("[EEPROM] migrated volume %u -> V%u; station tables preserved\n",
+      serialMonitor.printf("[EEPROM] migrated volume %u -> V%u; station tables preserved\n",
                     legacyVolume, vol);
     }
 
@@ -265,7 +265,7 @@ bool DABreadEEPROM(byte channel){
     const int result = extEEPROM.read(
         ADDR_DAB_CHANNEL + 28U * (channel - 1U), record, sizeof(record));
     if (result != 0 || record[0] != channel) {
-      Serial.printf("[EEPROM][WARN] DAB record %u read failed: result=%d id=%u\n",
+      serialMonitor.printf("[EEPROM][WARN] DAB record %u read failed: result=%d id=%u\n",
                     channel, result, record[0]);
       return false;
     }
@@ -284,13 +284,42 @@ bool DABreadEEPROM(byte channel){
     return true;
 }
 
+bool updateDABchannelLabelIfMatch(byte channel, byte frequencyIndex,
+                                  uint32_t expectedServiceId,
+                                  uint32_t expectedComponentId,
+                                  const char label[17], byte charset) {
+    if (channel < 1 || channel > totalDABchannels || label == nullptr)
+      return false;
+    uint8_t record[28] = {0};
+    const uint32_t address = ADDR_DAB_CHANNEL + 28U * (channel - 1U);
+    if (extEEPROM.read(address, record, sizeof(record)) != 0 ||
+        record[0] != channel || record[1] != frequencyIndex) return false;
+
+    uint32_t storedServiceId = 0;
+    uint32_t storedComponentId = 0;
+    memcpy(&storedServiceId, record + 3, sizeof(storedServiceId));
+    memcpy(&storedComponentId, record + 7, sizeof(storedComponentId));
+    storedComponentId &= 0xFFFFU;
+    expectedComponentId &= 0xFFFFU;
+    if (storedServiceId != expectedServiceId ||
+        storedComponentId != expectedComponentId) return false;
+    if (memcmp(record + 11, label, 16) == 0 && record[27] == charset)
+      return false;
+
+    uint8_t labelRecord[17];
+    memcpy(labelRecord, label, 16);
+    labelRecord[16] = charset;
+    return extEEPROM.write(address + 11U, labelRecord,
+                           sizeof(labelRecord)) == 0;
+}
+
 bool FMreadEEPROM(byte channel){
     if (channel < 1 || channel > MAX_FM_STATIONS) return false;
     uint8_t record[13] = {0};
     const int result = extEEPROM.read(
         ADDR_FM_CHANNEL + 13U * (channel - 1U), record, sizeof(record));
     if (result != 0 || record[0] != channel) {
-      Serial.printf("[EEPROM][WARN] FM record %u read failed: result=%d id=%u\n",
+      serialMonitor.printf("[EEPROM][WARN] FM record %u read failed: result=%d id=%u\n",
                     channel, result, record[0]);
       return false;
     }
@@ -431,7 +460,7 @@ void commitDirtySettingsIfDue() {
     written += sizeof(record);
   }
   settingsDirty = 0;
-  Serial.printf("[EEPROM] settings committed after 5 s (%u byte%s written)\n",
+  serialMonitor.printf("[EEPROM] settings committed after 5 s (%u byte%s written)\n",
                 written, written == 1 ? "" : "s");
 }
 

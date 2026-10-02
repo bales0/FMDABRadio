@@ -171,12 +171,14 @@ class DAB {
   uint32_t signalSampleGeneration() const;
   uint32_t timeSampleGeneration() const;
   uint32_t fmClockGeneration() const;
+  uint32_t dabServiceListGeneration() const;
   const fm_features::AfList& fmAfList() const;
   bool slideshowEnabled() const;
   bool slideshowAvailable() const;
   bool slideshowCollecting() const;
   uint8_t slideshowProgress() const;
   bool takeSlideshowUpdate();
+  void acknowledgeSlideshow();
   void discardSlideshow();
   const uint8_t* slideshowData() const;
   uint32_t slideshowLength() const;
@@ -207,9 +209,11 @@ class DAB {
     FmSeekCommand,
     FmSeekWaitStc,
     DabTuneCommand,
+    DabTuneRetry,
     DabTuneWaitStc,
     DabStopDataServiceCommand,
     DabStopServiceCommand,
+    DabStopRetry,
     DabServiceSettle,
     DabServiceCommand,
     DabServiceRetry,
@@ -277,6 +281,7 @@ class DAB {
   bool storeSlideshowSegment(uint16_t segment, const uint8_t* data,
                              uint16_t dataLength);
   void finishSlideshowObject();
+  void resetDabAudioInfo(uint32_t notBeforeMs = 0U);
   void startFmStatus(bool acknowledgeStc);
   void startDabStatus(bool acknowledgeStc);
   void startDabStopDataCommand();
@@ -333,6 +338,7 @@ class DAB {
   uint32_t _signalSampleGeneration;
   uint32_t _timeSampleGeneration;
   uint32_t _fmClockGeneration;
+  uint32_t _dabServiceListGeneration;
   uint32_t _stateDeadlineMs;
   uint32_t _operationDeadlineMs;
   uint32_t _patchOffset;
@@ -342,6 +348,8 @@ class DAB {
   uint8_t _fmSeekSpacing;
   uint8_t _fmDeEmphasis;
   uint8_t _dabTuneTarget;
+  uint8_t _dabTuneBusyRetries;
+  uint32_t _dabTuneRetryNotBeforeMs;
   uint32_t _serviceId;
   uint32_t _componentId;
   uint32_t _activeServiceId;
@@ -364,6 +372,9 @@ class DAB {
   bool _dabEnsembleRefreshPending;
   bool _dabTimeRefreshPending;
   bool _dabAudioRefreshPending;
+  bool _dabAudioInfoValid;
+  uint8_t _dabAudioInfoRetryCount;
+  uint32_t _dabAudioInfoNotBeforeMs;
   bool _dabServiceInfoRefreshPending;
   bool _dabSubchannelRefreshPending;
   uint8_t _dsrvBurstCount;
@@ -416,11 +427,13 @@ class DAB {
   uint16_t _slideshowSegmentLengths[SLS_MAX_SEGMENTS];
   uint8_t _slideshowSegmentBitmap[(SLS_MAX_SEGMENTS + 7) / 8];
   uint32_t _slideshowTransportId;
+  uint32_t _slideshowCompletedTransportId;
   uint16_t _slideshowHighestSegment;
   uint16_t _slideshowTotalSegments;
   uint32_t _slideshowExpectedLength;
   uint32_t _slideshowReceivedBytes;
   uint32_t _slideshowImageLength;
+  uint32_t _slideshowLastImageLength;
   uint32_t _slideshowLastActivityMs;
   uint32_t _slideshowServiceId;
   uint32_t _slideshowComponentId;
@@ -429,6 +442,8 @@ class DAB {
   bool _slideshowCollecting;
   bool _slideshowAvailable;
   bool _slideshowUpdate;
+  bool _slideshowPublishedPending;
+  bool _slideshowCompletedTransportValid;
 
   uint32_t _irqCounter;
   uint32_t _commandErrors;
@@ -441,6 +456,14 @@ class DAB {
   uint32_t _lastMetadataStatusMs;
   uint32_t _lastStatusDiagnosticMs;
   uint32_t _lastMotSegmentLogMs;
+  uint32_t _diagDabHostStarvationCount;
+  uint32_t _diagDabHostStarvationMaxGapUs;
+  uint32_t _diagDabGenuineCtsTimeoutCount;
+  uint32_t _diagDabTuneBusyCount;
+  uint32_t _diagDabAudioNotAvailableCount;
+  uint32_t _diagLastCtsReportMs;
+  uint32_t _diagReportedHostStarvationCount;
+  uint32_t _diagReportedGenuineCtsCount;
 };
 
 #endif

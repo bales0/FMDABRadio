@@ -42,6 +42,21 @@ int main() {
   assert(fm_af::weakSignal(true, 15, 2, 20, 4));
   assert(fm_af::candidateIsBetter(true, 0x1234, 0x1234, 15, 5, 22, 4));
   assert(!fm_af::candidateIsBetter(true, 0x1234, 0x5678, 15, 5, 30, 9));
+  // A tune invalidates PI to zero until fresh RDS arrives; zero can never
+  // satisfy candidate validation even if RF metrics look better.
+  assert(!fm_af::candidateIsBetter(true, 0x1234, 0, 15, 5, 30, 9));
+  assert(!fm_af::sweepExpired(99U, 100U));
+  assert(fm_af::sweepExpired(100U, 100U));
+
+  assert(fm_af::automaticProbeAllowed(true, true, false, false, true, false));
+  assert(!fm_af::automaticProbeAllowed(true, true, true, false, true, false));
+  assert(!fm_af::automaticProbeAllowed(true, true, false, false, false, false));
+  assert(!fm_af::automaticProbeAllowed(true, true, false, false, true, true));
+  assert(fm_af::shouldDeferUserEvent(true, false));
+  assert(!fm_af::shouldDeferUserEvent(true, true));
+  assert(!fm_af::canResumeUserEvent(true, false));
+  assert(fm_af::canResumeUserEvent(false, false));
+  assert(!fm_af::canResumeUserEvent(false, true));
 
   assert(stepFmFrequency(10800, 10,
                          static_cast<uint8_t>(FmRegion::Europe)) == 8750);

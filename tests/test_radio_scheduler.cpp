@@ -9,6 +9,39 @@ int main() {
   assert(dab_scheduler::generationMatches(7U, 7U));
   assert(!dab_scheduler::generationMatches(6U, 7U));
 
+  // A long host service gap is UART/main-loop starvation, not evidence that
+  // the Si4684 failed to assert CTS. A short-gap timeout remains genuine.
+  assert(dab_scheduler::classifyCtsTimeout(false, 8000U) ==
+         dab_scheduler::CtsTimeoutClass::NotTimeout);
+  assert(dab_scheduler::classifyCtsTimeout(true, 8000U) ==
+         dab_scheduler::CtsTimeoutClass::HostStarved);
+  assert(dab_scheduler::classifyCtsTimeout(true, 38U) ==
+         dab_scheduler::CtsTimeoutClass::Genuine);
+  uint8_t consecutiveCts = 0U;
+  for (uint8_t i = 0; i < 8U; ++i) {
+    consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+        dab_scheduler::CtsTimeoutClass::HostStarved, consecutiveCts);
+    assert(consecutiveCts == 0U);
+  }
+  for (uint8_t i = 0; i < 3U; ++i) {
+    consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+        dab_scheduler::CtsTimeoutClass::Genuine, consecutiveCts);
+  }
+  assert(dab_scheduler::ctsRecoveryRequired(consecutiveCts));
+  consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+      dab_scheduler::CtsTimeoutClass::NotTimeout, consecutiveCts);
+  assert(consecutiveCts == 0U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(0U) == 400U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(1U) == 500U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(2U) == 1000U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(3U) == 2000U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(4U) == 10000U);
+  assert(dab_scheduler::DAB_SCAN_LIST_SETTLE_MS == 1000U);
+  assert(dab_scheduler::DAB_SCAN_LIST_RETRY_MS == 1500U);
+  assert(dab_scheduler::DAB_SCAN_NO_SIGNAL_TIMEOUT_MS == 2500U);
+  assert(dab_scheduler::DAB_SCAN_LIST_TIMEOUT_MS == 9000U);
+  assert(dab_scheduler::DAB_SCAN_LIST_MAX_REQUESTS == 4U);
+
   uint8_t retryCount = 0;
   uint32_t notBefore = 0;
   assert(dab_scheduler::retryReady(100U, notBefore));
@@ -146,6 +179,16 @@ int main() {
   assert(dab_scheduler::takeGeneration(1U, consumedTimeGeneration));
   assert(!dab_scheduler::takeGeneration(1U, consumedTimeGeneration));
   assert(dab_scheduler::takeGeneration(2U, consumedTimeGeneration));
+
+  // DAB scan commits only a list newer than the tune baseline. A provisional
+  // list is followed by one explicit refresh generation; an empty label does
+  // not participate in this decision.
+  assert(!dab_scheduler::serviceListArrived(0U, 0U));
+  assert(!dab_scheduler::serviceListArrived(7U, 7U));
+  assert(dab_scheduler::serviceListArrived(8U, 7U));
+  assert(!dab_scheduler::refreshedServiceListArrived(8U, 8U, true));
+  assert(!dab_scheduler::refreshedServiceListArrived(9U, 8U, false));
+  assert(dab_scheduler::refreshedServiceListArrived(9U, 8U, true));
 
   // Normal DEBUG logs only milestones at no more than two periodic lines per
   // second; explicit verbose mode allows every segment.
