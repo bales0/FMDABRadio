@@ -132,6 +132,43 @@ static void expectProgressive(const char* progressiveName,
   assert(progressiveSink.pixels == baselineSink.pixels);
 }
 
+static void testSlideshowSquareScaling() {
+  const int displayWidth = 160;
+  const int displayHeight = 128;
+  std::vector<uint8_t> workspace(76800U);
+
+  std::vector<uint8_t> progressive =
+      readFixture("progressive_320x320_420.jpg");
+  JPEGImageInfo progressiveInfo;
+  assert(JPEGpreflight(progressive.data(), progressive.size(),
+                       displayWidth, displayHeight, progressiveInfo) ==
+         JPEGPreflightResult::SupportedProgressive);
+  assert(progressiveInfo.scaleDivisor == 3U);
+  assert(JPEGvalidate(progressive.data(), progressive.size(),
+                      displayWidth, displayHeight, workspace.data(),
+                      workspace.size(), &progressiveInfo));
+  TestDisplaySink progressiveSink;
+  JPEGDisplay progressiveDisplay(collectPixels, &progressiveSink);
+  assert(JPEGdecoder(progressive.data(), progressive.size(),
+                     progressiveDisplay, displayWidth, displayHeight,
+                     workspace.data(), workspace.size(), &progressiveInfo));
+  assert(progressiveSink.pushedLines == 107);
+  assert(progressiveSink.pushedPixels == 107 * 107);
+
+  std::vector<uint8_t> baseline = readFixture("baseline_320x320_420.jpg");
+  JPEGImageInfo baselineInfo;
+  assert(JPEGpreflight(baseline.data(), baseline.size(),
+                       displayWidth, displayHeight, baselineInfo) ==
+         JPEGPreflightResult::SupportedBaseline);
+  assert(baselineInfo.scaleDivisor == 3U);
+  TestDisplaySink baselineSink;
+  JPEGDisplay baselineDisplay(collectPixels, &baselineSink);
+  assert(JPEGdecoder(baseline.data(), baseline.size(), baselineDisplay,
+                     displayWidth, displayHeight, workspace.data(),
+                     workspace.size(), &baselineInfo));
+  assert(progressiveSink.pixels == baselineSink.pixels);
+}
+
 static void testAlphaPngFixture() {
   const std::vector<uint8_t> png = readFixture("alpha.png");
   static const uint8_t signature[8] =
@@ -180,8 +217,8 @@ static void testCorruptAndUnsupportedInputs() {
   std::vector<uint8_t> oversized = original;
   const size_t sof = findMarker(oversized, 0xC0U);
   assert(sof + 8U < oversized.size());
-  oversized[sof + 7U] = 0x02U;
-  oversized[sof + 8U] = 0x81U;  // width 641; still too wide at 50%
+  oversized[sof + 7U] = 0x05U;
+  oversized[sof + 8U] = 0x01U;  // width 1281; still too wide at 25%
   assert(JPEGpreflight(oversized.data(), oversized.size(), 320, 240, info) ==
          JPEGPreflightResult::UnsupportedDimensions);
 
@@ -282,6 +319,7 @@ int main() {
   expectProgressive("progressive_320x320_420.jpg",
                     "baseline_320x320_420.jpg",
                     3U, 2U, 2U, false, 320U, 320U, 2U);
+  testSlideshowSquareScaling();
   testCorruptAndUnsupportedInputs();
   testAlphaPngFixture();
   return 0;

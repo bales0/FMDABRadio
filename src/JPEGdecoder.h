@@ -67,8 +67,9 @@ bool JPEGvalidate(const uint8_t* data, size_t size,
                   bool verboseScanDiagnostics = false);
 
 // Decode a JPEG directly from RAM and render it. Baseline and progressive
-// Huffman streams use bounded caller-owned workspace and strict end-of-scan
-// validation; no full-frame coefficient buffer is allocated.
+// Huffman streams use bounded caller-owned workspace, automatic integer
+// downscaling up to 1:4 and strict end-of-scan validation; no full-frame
+// coefficient buffer is allocated.
 bool JPEGdecoder(const uint8_t* data, size_t size, JPEGDisplay& tft,
                  int displayWidth = 320, int displayHeight = 240,
                  uint8_t* workspace = nullptr, size_t workspaceSize = 0,

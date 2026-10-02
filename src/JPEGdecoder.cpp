@@ -222,15 +222,26 @@ JPEGPreflightResult JPEGpreflight(const uint8_t* data, size_t size,
 
   if (!foundEoi || (!info.sof0 && !info.sof2) || info.scans == 0U)
     return JPEGPreflightResult::InvalidJpeg;
-  if (info.width > static_cast<uint16_t>(displayWidth) ||
-      info.height > static_cast<uint16_t>(displayHeight)) {
-    const uint16_t halfWidth = static_cast<uint16_t>((info.width + 1U) / 2U);
-    const uint16_t halfHeight = static_cast<uint16_t>((info.height + 1U) / 2U);
-    if (halfWidth > static_cast<uint16_t>(displayWidth) ||
-        halfHeight > static_cast<uint16_t>(displayHeight))
-      return JPEGPreflightResult::UnsupportedDimensions;
-    info.scaleDivisor = 2U;
+  if (displayWidth <= 0 || displayHeight <= 0)
+    return JPEGPreflightResult::UnsupportedDimensions;
+  // Use the smallest integer decimation that preserves the complete image.
+  // Divisors up to four cover common DAB SLS artwork such as 320x320 on the
+  // 160x128 display without cropping (320x320 -> 107x107 at 1:3).
+  for (uint8_t divisor = 1U; divisor <= 4U; ++divisor) {
+    const uint16_t scaledWidth = static_cast<uint16_t>(
+        (static_cast<uint32_t>(info.width) + divisor - 1U) / divisor);
+    const uint16_t scaledHeight = static_cast<uint16_t>(
+        (static_cast<uint32_t>(info.height) + divisor - 1U) / divisor);
+    if (scaledWidth <= static_cast<uint16_t>(displayWidth) &&
+        scaledHeight <= static_cast<uint16_t>(displayHeight)) {
+      info.scaleDivisor = divisor;
+      break;
+    }
   }
+  if (info.scaleDivisor == 1U &&
+      (info.width > static_cast<uint16_t>(displayWidth) ||
+       info.height > static_cast<uint16_t>(displayHeight)))
+    return JPEGPreflightResult::UnsupportedDimensions;
   if (info.components != 1U && info.components != 3U)
     return JPEGPreflightResult::UnsupportedComponents;
   if (info.sof2) return JPEGPreflightResult::SupportedProgressive;
@@ -1196,7 +1207,7 @@ static bool pjOutputMCURow(PJDecoder* d, int16_t* rowCoefs, int mcuRow,
                            uint8_t* allBlocks, uint8_t scaleDivisor) {
   int totalBlocks = d->mcuCntX * d->blocksPerMCU;
   uint16_t lineBuffer[320];
-  if (scaleDivisor != 2U) scaleDivisor = 1U;
+  if (scaleDivisor < 1U || scaleDivisor > 4U) scaleDivisor = 1U;
   const int outputWidth =
       (static_cast<int>(d->width) + scaleDivisor - 1) / scaleDivisor;
 
@@ -1654,7 +1665,9 @@ static bool JPEGdecodePass(const uint8_t* data, size_t size, JPEGDisplay* tft,
     f.close();
     return false;
   }
-  const uint8_t scaleDivisor = info.scaleDivisor == 2U ? 2U : 1U;
+  const uint8_t scaleDivisor =
+      info.scaleDivisor >= 1U && info.scaleDivisor <= 4U
+          ? info.scaleDivisor : 1U;
   const uint16_t outputWidth = static_cast<uint16_t>(
       (d->width + scaleDivisor - 1U) / scaleDivisor);
   const uint16_t outputHeight = static_cast<uint16_t>(
