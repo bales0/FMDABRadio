@@ -188,7 +188,6 @@ void loadUiSettings() {
     uiSettings.techEnabled = 0;
     uiSettings.defaultView = 0;
     uiSettings.slideshowMode = recordV4[8] <= 2 ? recordV4[8] : 1;
-    uiSettings.slideshowLayout = recordV4[9] ? 1 : 0;
     uiSettings.fmRegion = sanitizeFmRegion(recordV4[10]);
     uiSettings.fmAfEnabled = recordV4[11] ? 1 : 0;
     uiSettings.signalUnits = recordV4[12] <= 2 ? recordV4[12] : 0;
@@ -203,12 +202,12 @@ void loadUiSettings() {
     uiSettings.defaultView = 0;
     if (validV2 || validV3) {
       uiSettings.slideshowMode = record[8] <= 2 ? record[8] : 1;
-      uiSettings.slideshowLayout = record[9] ? 1 : 0;
     }
     if (validV3) {
       uiSettings.fmRegion = sanitizeFmRegion(record[10]);
     }
   }
+  uiSettings.slideshowLayout = 1;  // Ignore legacy Info layout selection.
   uiSettings.fmRegion = sanitizeFmRegion(uiSettings.fmRegion);
   persistedUiSettings = pendingUiSettings = uiSettings;
 }

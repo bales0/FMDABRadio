@@ -6,7 +6,22 @@ const uint16_t UI_DIM_TIMEOUT_SECONDS[] = {15, 30, 60, 120};
 constexpr uint16_t UI_GRAY = 0x8410;
 constexpr uint16_t UI_DARK_LINE = 0x3186;
 constexpr uint16_t UI_ORANGE = 0xFD20;
-constexpr uint8_t UI_MENU_ITEMS = 11;
+constexpr uint8_t UI_MENU_ITEMS = 10;
+struct UiListRowCache {
+  bool valid = false;
+  uint16_t item = 0;
+  bool selected = false;
+  String label;
+  String value;
+};
+UiListRowCache stationListRows[UI_LIST_ROWS];
+UiListRowCache menuRows[5];
+bool stationListPainted = false;
+bool menuPainted = false;
+bool stationListWasEmpty = false;
+String stationListHeader;
+uint8_t paintedMenuLanguage = 0;
+uint8_t paintedMenuTheme = 0;
 uint8_t menuFmRegionOnOpen = static_cast<uint8_t>(FmRegion::Europe);
 uint32_t uiObservedMotPackets = 0;
 uint32_t uiMotActivityUntilMs = 0;
@@ -863,9 +878,7 @@ void renderUiStatusStatic() {
 
 void renderUiStatus() {
   if (scanActive()) return;
-  if (uiView == UiView::Slideshow) {
-    renderSlideshowStatus();
-  } else if (uiView == UiView::Text) {
+  if (uiView == UiView::Text) {
     renderUiStatusStatic();
     renderUiSignal();
   }
@@ -881,26 +894,6 @@ void renderListeningScreen() {
   renderUiStatus();
 }
 
-void renderSlideshowStatus() {
-  if (uiView != UiView::Slideshow || uiSettings.slideshowLayout != 0 ||
-      scanActive()) {
-    return;
-  }
-  tft.fillRect(0, 113, screenWidth, 15, ST77XX_BLACK);
-  tft.drawFastHLine(0, 112, screenWidth, UI_DARK_LINE);
-  String station = currentUiStationName();
-  if (utf8CodepointCount(station) > 13) station = utf8Slice(station, 0, 13);
-  drawUtf8Text(station, 2, 115, ST77XX_RED, 1, 78);
-  drawUtf8Text(ensemble < DAB_FREQS ? String(UI_DAB_CHANNELS[ensemble]) : "--",
-               83, 115, ST77XX_WHITE, 1, 20);
-  char value[8];
-  snprintf(value, sizeof(value), "V%u", vol);
-  drawUtf8Text(String(value), 106, 115, ST77XX_GREEN, 1, 27);
-  const int8_t displayedSnr = uiDisplayedSnr();
-  snprintf(value, sizeof(value), "C%d", displayedSnr);
-  drawUtf8Text(String(value), 135, 115, uiSignalColor(displayedSnr, true), 1, 24);
-}
-
 bool renderSlideshowScreen() {
   uiView = UiView::Slideshow;
   if (dabMode != 1 || uiSettings.slideshowMode == 0) {
@@ -914,13 +907,11 @@ bool renderSlideshowScreen() {
     drawUtf8Text("Waiting for slideshow...", 17, 51,
                  ST77XX_CYAN, 1, 130);
     uiSlideshowDecodePending = true;
-    renderSlideshowStatus();
     return true;
   }
-  const int16_t imageHeight = uiSettings.slideshowLayout ? screenHeight : 112;
   const bool decoded = renderRamSlideshow(
       tft, Dab.slideshowData(), Dab.slideshowLength(), 0, 0,
-      screenWidth, imageHeight, &serialMonitor);
+      screenWidth, screenHeight, &serialMonitor);
   uiSlideshowDecodePending = false;
   if (!decoded) {
     // The decoder validates before its first pixel write. Keep the last valid
@@ -929,7 +920,6 @@ bool renderSlideshowScreen() {
     markUiDirty(UI_DIRTY_STATUS);
     return false;
   }
-  renderSlideshowStatus();
   // Keep the complete compressed object available so leaving and reopening
   // the slideshow redraws the same image immediately. acknowledgeSlideshow()
   // only releases collector ownership; the first segment of a genuinely new
@@ -961,10 +951,6 @@ void flushUiDirty() {
     if ((dirty & UI_DIRTY_TEXT) != 0) renderUiTextArea();
     if ((dirty & UI_DIRTY_STATUS) != 0) renderUiStatusStatic();
     if ((dirty & UI_DIRTY_SIGNAL) != 0) renderUiSignal();
-  } else if (uiView == UiView::Slideshow &&
-             (dirty & (UI_DIRTY_HEADER | UI_DIRTY_STATION |
-                       UI_DIRTY_STATUS | UI_DIRTY_SIGNAL)) != 0) {
-    renderSlideshowStatus();
   }
 }
 
@@ -1162,36 +1148,52 @@ void cycleUiScreen() {
 
 void renderStationList() {
   if (uiView != UiView::StationList) return;
-  clearScreen();
+  const uint16_t total = currentUiStationCount();
+  const bool full = !stationListPainted || stationListWasEmpty != (total == 0);
+  if (full) {
+    clearScreen();
+    for (uint8_t row = 0; row < UI_LIST_ROWS; ++row)
+      stationListRows[row].valid = false;
+    tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
+  }
+  stationListPainted = true;
+  stationListWasEmpty = total == 0;
   char header[28];
   snprintf(header, sizeof(header), "%s stations  V%u",
            dabMode == 1 ? "DAB" : "FM", vol);
-  drawUtf8Text(String(header), 2, 1, ST77XX_CYAN, 1, 156);
-  tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
-  const uint16_t total = currentUiStationCount();
+  if (full || stationListHeader != header) {
+    tft.fillRect(0, 0, screenWidth, 14, ST77XX_BLACK);
+    drawUtf8Text(String(header), 2, 1, ST77XX_CYAN, 1, 156);
+    stationListHeader = header;
+  }
   if (total == 0) {
-    drawUtf8Text("No stations - hold SCAN", 2, 36, ST77XX_RED, 1, 156);
+    if (full)
+      drawUtf8Text("No stations - hold SCAN", 2, 36, ST77XX_RED, 1, 156);
     return;
   }
   if (stationListSelection < 1) stationListSelection = 1;
   if (stationListSelection > total) stationListSelection = total;
   const uint16_t lastTop = total > UI_LIST_ROWS
                                ? total - UI_LIST_ROWS + 1U : 1U;
-  if (stationListTop < 1) stationListTop = 1;
+  // Keep the selection on the middle row while there are enough entries
+  // on both sides. Clamp the window at either end so the cursor reaches
+  // the first/last row before the next navigation step wraps the selection.
+  constexpr uint8_t middleRow = UI_LIST_ROWS / 2U;
+  stationListTop = stationListSelection > middleRow
+                       ? stationListSelection - middleRow : 1U;
   if (stationListTop > lastTop) stationListTop = lastTop;
-  if (stationListSelection < stationListTop) {
-    stationListTop = stationListSelection;
-  } else if (stationListSelection >= stationListTop + UI_LIST_ROWS) {
-    stationListTop = stationListSelection - UI_LIST_ROWS + 1U;
-  }
   for (uint8_t row = 0; row < UI_LIST_ROWS; ++row) {
     const uint16_t channel = stationListTop + row;
-    if (channel > total) break;
     const int16_t y = 18 + row * 15;
+    UiListRowCache& cached = stationListRows[row];
+    if (channel > total) {
+      if (cached.valid) tft.fillRect(0, y, screenWidth, 14, ST77XX_BLACK);
+      cached.valid = false;
+      continue;
+    }
     const bool selected = channel == stationListSelection;
     const uint16_t rowColor = selected ? 0x04B6
                                        : (row & 1U ? 0x1082 : ST77XX_BLACK);
-    tft.fillRect(0, y, screenWidth, 14, rowColor);
     char label[18];
     uint16_t frequency;
     uint8_t charset;
@@ -1199,18 +1201,26 @@ void renderStationList() {
         channel, label, sizeof(label), frequency, charset);
     char prefix[6];
     snprintf(prefix, sizeof(prefix), "%3u ", channel);
-    drawUtf8Text(String(prefix), 1, y, selected ? ST77XX_WHITE : 0x7BEF, 1, 28);
     const String decodedLabel = !recordValid ? String("<read error>") :
         (dabMode == 1
         ? decodeBroadcastText(reinterpret_cast<const uint8_t*>(label), 16,
                               charset)
         : decodeRdsText(reinterpret_cast<const uint8_t*>(label), 8));
+    if (cached.valid && cached.item == channel &&
+        cached.selected == selected && cached.label == decodedLabel) continue;
+    tft.fillRect(0, y, screenWidth, 14, rowColor);
+    drawUtf8Text(String(prefix), 1, y, selected ? ST77XX_WHITE : 0x7BEF, 1, 28);
     drawUtf8Text(decodedLabel, 30, y,
                  selected ? ST77XX_WHITE : ST77XX_CYAN, 1, 128);
+    cached.valid = true;
+    cached.item = channel;
+    cached.selected = selected;
+    cached.label = decodedLabel;
   }
 }
 
 void openStationList() {
+  stationListPainted = false;
   uiViewBeforeModal = uiView == UiView::Slideshow ? uiView : UiView::Text;
   uiView = UiView::StationList;
   stationListSelection = dabMode == 1 ? currentDABchannel : currentFMchannel;
@@ -1220,10 +1230,6 @@ void openStationList() {
   } else {
     if (stationListSelection < 1) stationListSelection = 1;
     if (stationListSelection > total) stationListSelection = total;
-    stationListTop = total > UI_LIST_ROWS
-                         ? min<uint16_t>(stationListSelection,
-                                         total - UI_LIST_ROWS + 1U)
-                         : 1U;
   }
   serialMonitor.printf("[UI] station list open: band=%s total=%u selected=%u free=%u min=%u largest=%u stackHwm=%u\n",
                 dabMode == 1 ? "DAB" : "FM", total, stationListSelection,
@@ -1264,16 +1270,31 @@ void tuneStationListSelection() {
 
 void renderMenu() {
   if (uiView != UiView::Menu) return;
-  clearScreen();
-  drawUtf8Text(uiText("Settings", "Nastaveni"), 2, 1, uiAccentColor(), 1, 156);
-  tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
+  const bool full = !menuPainted;
+  const bool styleChanged = full || paintedMenuLanguage != uiSettings.language ||
+      paintedMenuTheme != uiSettings.theme;
+  if (full) {
+    clearScreen();
+    for (uint8_t row = 0; row < 5; ++row) menuRows[row].valid = false;
+    tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
+  }
+  if (styleChanged) {
+    tft.fillRect(0, 0, screenWidth, 14, ST77XX_BLACK);
+    drawUtf8Text(uiText("Settings", "Nastaveni"), 2, 1, uiAccentColor(), 1, 156);
+    tft.fillRect(0, 115, screenWidth, 13, ST77XX_BLACK);
+    drawUtf8Text(uiText("Hold SELECT = back", "Drzet SELECT = zpet"),
+                 2, 116, UI_GRAY, 1, 156);
+  }
+  menuPainted = true;
+  paintedMenuLanguage = uiSettings.language;
+  paintedMenuTheme = uiSettings.theme;
   constexpr uint8_t visibleItems = 5;
   const char* labelsEn[UI_MENU_ITEMS] = {
-      "Brightness", "Dim level", "Dim after", "Slideshow", "SLS layout",
+      "Brightness", "Dim level", "Dim after", "Slideshow",
       "FM region", "FM AF", "Signal units", "Theme", "Language",
       "Serial control"};
   const char* labelsCs[UI_MENU_ITEMS] = {
-      "Jas", "Jas v klidu", "Ztlumit za", "Slideshow", "Vzhled SLS",
+      "Jas", "Jas v klidu", "Ztlumit za", "Slideshow",
       "FM oblast", "FM AF", "Jednotky", "Motiv", "Jazyk",
       "Seriove rizeni"};
   if (menuSelection < menuTop) menuTop = menuSelection;
@@ -1282,14 +1303,17 @@ void renderMenu() {
   }
   for (uint8_t row = 0; row < visibleItems; ++row) {
     const uint8_t item = menuTop + row;
-    if (item >= UI_MENU_ITEMS) break;
     const int16_t y = 19 + row * 19;
+    UiListRowCache& cached = menuRows[row];
+    if (item >= UI_MENU_ITEMS) {
+      if (cached.valid) tft.fillRect(0, y, screenWidth, 18, ST77XX_BLACK);
+      cached.valid = false;
+      continue;
+    }
     const bool selected = item == menuSelection;
-    tft.fillRect(0, y, screenWidth, 18,
-                 selected ? 0x04B6 : (item & 1U ? 0x1082 : ST77XX_BLACK));
-    drawUtf8Text(String(uiSettings.language == 1 ? labelsCs[item]
-                                                  : labelsEn[item]), 2, y,
-                 selected ? ST77XX_WHITE : uiAccentColor(), 1, 92);
+    const uint16_t background = selected ? 0x04B6
+        : (item & 1U ? 0x1082 : ST77XX_BLACK);
+    const String label = uiSettings.language == 1 ? labelsCs[item] : labelsEn[item];
     char value[15];
     switch (item) {
       case 0: snprintf(value, sizeof(value), "%u%%", uiSettings.brightness); break;
@@ -1300,24 +1324,35 @@ void renderMenu() {
                        uiSettings.slideshowMode == 0 ? "Off" :
                        (uiSettings.slideshowMode == 1 ? "Manual" : "Auto")); break;
       case 4: snprintf(value, sizeof(value), "%s",
-                       uiSettings.slideshowLayout ? "Full" : "Info"); break;
-      case 5: snprintf(value, sizeof(value), "%s",
                        fmRegionProfile(uiSettings.fmRegion).menuName); break;
-      case 6: snprintf(value, sizeof(value), "%s",
+      case 5: snprintf(value, sizeof(value), "%s",
                        uiSettings.fmAfEnabled ? "On" : "Off"); break;
-      case 7: snprintf(value, sizeof(value), "%s", uiSignalUnitName()); break;
-      case 8: snprintf(value, sizeof(value), "%s",
+      case 6: snprintf(value, sizeof(value), "%s", uiSignalUnitName()); break;
+      case 7: snprintf(value, sizeof(value), "%s",
                         uiSettings.theme == 0 ? "Classic" :
                         (uiSettings.theme == 1 ? "Amber" : "Ice")); break;
-      case 9: snprintf(value, sizeof(value), "%s",
+      case 8: snprintf(value, sizeof(value), "%s",
                         uiSettings.language == 0 ? "English" : "Cestina"); break;
       default: snprintf(value, sizeof(value), "%s",
                         uiSettings.serialControl ? "On" : "Off"); break;
     }
-    drawUtf8Text(String(value), 98, y, ST77XX_GREEN, 1, 60);
+    const bool rowChanged = styleChanged || !cached.valid ||
+        cached.item != item || cached.selected != selected || cached.label != label;
+    if (rowChanged) {
+      tft.fillRect(0, y, screenWidth, 18, background);
+      drawUtf8Text(label, 2, y,
+                   selected ? ST77XX_WHITE : uiAccentColor(), 1, 92);
+    } else if (cached.value != value) {
+      tft.fillRect(98, y, screenWidth - 98, 18, background);
+    }
+    if (rowChanged || cached.value != value)
+      drawUtf8Text(String(value), 98, y, ST77XX_GREEN, 1, 60);
+    cached.valid = true;
+    cached.item = item;
+    cached.selected = selected;
+    cached.label = label;
+    cached.value = value;
   }
-  drawUtf8Text(uiText("Hold SELECT = back", "Drzet SELECT = zpet"),
-               2, 116, UI_GRAY, 1, 156);
 }
 
 void applyUiBacklightSettings() {
@@ -1346,17 +1381,16 @@ void adjustMenu(int8_t direction) {
           static_cast<int>(uiSettings.dimTimeoutIndex) + direction, 0, 3);
       break;
     case 3:
-      uiSettings.slideshowMode = constrain(
-          static_cast<int>(uiSettings.slideshowMode) + direction, 0, 2);
+      uiSettings.slideshowMode = direction > 0
+          ? (uiSettings.slideshowMode + 1U) % 3U
+          : (uiSettings.slideshowMode == 0 ? 2U
+                                          : uiSettings.slideshowMode - 1U);
       if (!Dab.setSlideshowEnabled(uiSettings.slideshowMode != 0)) {
         uiSettings.slideshowMode = 0;
       }
       uiDefaultSlideshowPending = false;
       break;
     case 4:
-      uiSettings.slideshowLayout = !uiSettings.slideshowLayout;
-      break;
-    case 5:
       if (direction > 0) {
         uiSettings.fmRegion =
             static_cast<uint8_t>((sanitizeFmRegion(uiSettings.fmRegion) + 1U) %
@@ -1366,23 +1400,23 @@ void adjustMenu(int8_t direction) {
         uiSettings.fmRegion = region == 0 ? FM_REGION_COUNT - 1 : region - 1;
       }
       break;
-    case 6:
+    case 5:
       uiSettings.fmAfEnabled = !uiSettings.fmAfEnabled;
       break;
-    case 7:
+    case 6:
       uiSettings.signalUnits = direction > 0
           ? (uiSettings.signalUnits + 1U) % 3U
           : (uiSettings.signalUnits == 0 ? 2 : uiSettings.signalUnits - 1U);
       break;
-    case 8:
+    case 7:
       uiSettings.theme = direction > 0
           ? (uiSettings.theme + 1U) % 3U
           : (uiSettings.theme == 0 ? 2 : uiSettings.theme - 1U);
       break;
-    case 9:
+    case 8:
       uiSettings.language = !uiSettings.language;
       break;
-    case 10:
+    case 9:
       uiSettings.serialControl = !uiSettings.serialControl;
       break;
   }
@@ -1392,6 +1426,7 @@ void adjustMenu(int8_t direction) {
 }
 
 void openSettingsMenu() {
+  menuPainted = false;
   uiViewBeforeModal = uiView == UiView::Slideshow ? uiView : UiView::Text;
   uiView = UiView::Menu;
   menuSelection = 0;

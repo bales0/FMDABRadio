@@ -223,7 +223,7 @@ struct UiSettings {
   uint8_t techEnabled = 1;
   uint8_t defaultView = 0;
   uint8_t slideshowMode = 1;    // 0=off, 1=manual screen, 2=auto.
-  uint8_t slideshowLayout = 0;  // 0=status strip, 1=full screen.
+  uint8_t slideshowLayout = 1;  // Legacy EEPROM field; always full screen.
   uint8_t fmRegion = static_cast<uint8_t>(FmRegion::Europe);
   uint8_t fmAfEnabled = 0;
   uint8_t signalUnits = 0;      // 0=dBm, 1=dBf, 2=dBuV.
@@ -1118,6 +1118,7 @@ void handleButtonEvent(const ButtonEvent& event) {
 }
 
 void previewStation(int8_t direction) {
+  const bool alreadyListening = uiView == UiView::Text;
   if (dabMode == 1) {
     if (totalDABchannels == 0) return;
     const byte previousChannel = currentDABchannel;
@@ -1132,7 +1133,10 @@ void previewStation(int8_t direction) {
       return;
     }
     resetUiStationScroll();
-    renderListeningScreen();
+    if (alreadyListening)
+      markUiDirty(UI_DIRTY_HEADER | UI_DIRTY_STATION | UI_DIRTY_STATUS);
+    else
+      renderListeningScreen();
   } else {
     if (totalFMchannels == 0) return;
     const byte previousChannel = currentFMchannel;
@@ -1147,7 +1151,10 @@ void previewStation(int8_t direction) {
       return;
     }
     resetUiStationScroll();
-    renderListeningScreen();
+    if (alreadyListening)
+      markUiDirty(UI_DIRTY_HEADER | UI_DIRTY_STATION | UI_DIRTY_STATUS);
+    else
+      renderListeningScreen();
   }
 }
 
