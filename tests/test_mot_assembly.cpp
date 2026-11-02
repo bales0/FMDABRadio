@@ -32,16 +32,16 @@ int main() {
   assert(objectPacketBelongs(false, 1U, 2U, 7U));
   assert(objectPacketBelongs(true, 1U, 1U, 7U));
   assert(objectPacketBelongs(true, 1U, 2U, 0U));
-  assert(!objectPacketBelongs(true, 1U, 2U, 1U));
+  assert(objectPacketBelongs(true, 1U, 2U, 1U));
+  assert(!objectPacketBelongs(true, 1U, 2U, 1U, true));
 
-  // A published image is immutable until UI acknowledgement. Afterwards the
-  // completed Transport ID is still rejected, while segment zero of a new ID
-  // is allowed to take ownership of the single arena.
-  assert(!canAcceptTransport(true, true, 7U, 8U));
-  assert(!canAcceptTransport(false, true, 7U, 7U));
-  assert(canAcceptTransport(false, true, 7U, 8U));
+  // Only an explicit render lease blocks writes. A notification is reusable,
+  // and any valid segment can begin a new TID over the cached image.
+  assert(!canAcceptTransport(true));
+  assert(canAcceptTransport(false));
   assert(startsNewBodyOverCache(true, 0U));
-  assert(!startsNewBodyOverCache(true, 1U));
+  assert(startsNewBodyOverCache(true, 1U));
+  assert(startsNewBodyOverCache(true, 31U));
   assert(!startsNewBodyOverCache(false, 0U));
 
   const uint32_t arena = 50UL * 1024UL;

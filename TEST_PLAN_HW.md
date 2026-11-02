@@ -94,3 +94,19 @@ Výchozí EPG_ENABLE=0, compile opt-in nevytváří Core ani tuner příkazy.
   české akcenty i dolní diakritika, levý/pravý clipping, prázdný/změněný text,
   přechody FM/DAB/menu/SLS. Změřit dopad souvislého 4160B TFT přenosu na CTS.
 - EPG TFT indikátor a Now/Next zatím nečekat; příjem PI/SI patří do L2.
+
+## Audio activation/recovery
+
+Aktuální plán 20–50 cold bootů, přepínání mux/služeb/scan/FM, PAD-SLS,
+RF pauz, discovery ON/OFF a PC časování stávajících logů je v
+IMPLEMENTATION_REPORT_AUDIO_RECOVERY_MOT.md. Host testy nejsou HW potvrzení.
+Očekávat konečný retry budget a `Audio unavailable` po vyčerpání; `Ready`
+je idle transport, přijatý START a potvrzené audio info jsou samostatné stavy.
+
+## Plynulý SLS/MOT karusel
+
+Praktický postup Manual/Auto, A→B→C bez přeladění, LAST-first, stejný obsah a
+recyklované TID, partial reopen, RF pauza, discovery ON/OFF a kontrola
+CTS/overflow/RAM je v SLS_MOT_IMPLEMENTATION_REPORT_CZ.md. Na HW neprovedeno.
+Při dalším objektu může jediná aréna přestat obsahovat komprimované A; už
+vykreslené A zůstává v GRAM a SELECT během partial B používá čekací obrazovku.

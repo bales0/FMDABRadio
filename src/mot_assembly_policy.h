@@ -39,22 +39,19 @@ inline bool decodeHeaderCore(const uint8_t* data, uint16_t length,
 
 inline bool objectPacketBelongs(bool collecting, uint32_t currentObjectId,
                                 uint32_t incomingObjectId,
-                                uint16_t segment) {
-  return !collecting || currentObjectId == incomingObjectId || segment == 0U;
+                                uint16_t segment, bool retired=false) {
+  (void)segment;
+  return !collecting || currentObjectId == incomingObjectId || !retired;
 }
 
-inline bool canAcceptTransport(bool publishedPending,
-                               bool completedTransportValid,
-                               uint32_t completedTransportId,
-                               uint32_t incomingTransportId) {
-  return !publishedPending &&
-         (!completedTransportValid ||
-          completedTransportId != incomingTransportId);
+inline bool canAcceptTransport(bool renderOwned) {
+  return !renderOwned;
 }
 
 inline bool startsNewBodyOverCache(bool cachedImageAvailable,
                                    uint16_t segment) {
-  return cachedImageAvailable && segment == 0U;
+  (void)segment;
+  return cachedImageAvailable;
 }
 
 inline uint16_t totalSegmentsFromLast(uint16_t segment, bool last) {

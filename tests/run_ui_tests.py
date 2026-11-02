@@ -7,7 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def function(source, name):
-    start = source.index('void ' + name + '(') if 'void ' + name + '(' in source else source.index('uint16_t ' + name + '(')
+    start = next(source.index(prefix + name + '(') for prefix in ['void ', 'uint16_t ', 'bool ']
+                 if prefix + name + '(' in source)
     opening = source.index('{', start)
     end, depth = opening + 1, 1
     while depth:
@@ -35,6 +36,13 @@ def main():
         exe = directory / 'ui.exe'
         subprocess.run([args.cxx, '-std=c++11', '-Wall', '-Wextra', '-Werror', '-pedantic',
                         '-I' + str(ROOT / 'src'), str(path), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+        body = '\n'.join(function(source, name) for name in ['renderSlideshowScreen', 'serviceUiSlideshow'])
+        path.write_text((ROOT / 'tests/test_ui_slideshow.cpp').read_text(encoding='utf-8').replace('// PRODUCTION_FUNCTIONS', body), encoding='utf-8')
+        subprocess.run([args.cxx, '-std=c++11', '-Wall', '-Wextra', '-Werror', '-pedantic',
+                        '-DFMDAB_HOST_TEST', '-Wno-error=switch',
+                        '-I' + str(ROOT / 'tests/radio_shims'), '-I' + str(ROOT / 'tests/host_shims'),
+                        '-I' + str(ROOT / 'src'), str(path), str(ROOT / 'src/si4684.cpp'), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
     assert 'invalidateListeningPaint();' in (ROOT / 'src/Display.ino').read_text()
     print('LCD cache and invalidation contract PASS', flush=True)

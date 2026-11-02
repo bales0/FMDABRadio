@@ -558,6 +558,7 @@ struct UiStatusSnapshot {
   bool ta;
   bool motCollecting;
   bool motAvailable;
+  bool audioFailed;
   bool afActive;
   char ps[9];
 };
@@ -592,6 +593,7 @@ void noteUiStatusChanged() {
   current.ta = Dab.ta;
   current.motCollecting = Dab.slideshowCollecting();
   current.motAvailable = Dab.slideshowAvailable();
+  current.audioFailed = Dab.audioActivationFailed();
   current.afActive = fmAfActive();
   memcpy(current.ps, Dab.ps, sizeof(current.ps));
   const bool signalChanged = !previousValid ||
@@ -616,6 +618,7 @@ void noteUiStatusChanged() {
       current.motProgress != previous.motProgress ||
       current.motCollecting != previous.motCollecting ||
       current.motAvailable != previous.motAvailable ||
+      current.audioFailed != previous.audioFailed ||
       current.afCount != previous.afCount ||
       current.afActive != previous.afActive ||
       current.fmClockGeneration != previous.fmClockGeneration ||
@@ -867,7 +870,7 @@ void renderUiStatusStatic() {
   if (dabMode == 1) {
     static const char* const shortAudioMode[] = {"DUAL", "MONO", "ST", "J-ST"};
     if (Dab.bitrate == 0U || Dab.samplerate == 0U) {
-      snprintf(value, sizeof(value), "Audio loading...");
+      snprintf(value, sizeof(value), "%s", Dab.audioActivationFailed() ? "Audio unavailable" : "Audio loading...");
     } else {
       snprintf(value, sizeof(value), "%s %ukbit %ukHz %s",
                Dab.dabplus ? "HE-AAC" : "MP2", Dab.bitrate,
@@ -957,14 +960,16 @@ bool renderSlideshowScreen() {
     return true;
   }
   bool displayModified = false;
+  const uint32_t lease=Dab.beginSlideshowRender();
+  if(lease==0) return false;
   const bool decoded = renderRamSlideshow(
       tft, Dab.slideshowData(), Dab.slideshowLength(), 0, 0,
       screenWidth, screenHeight, &serialMonitor, &displayModified);
+  Dab.endSlideshowRender(lease,decoded);
   uiSlideshowDecodePending = false;
   if (!decoded) {
     // The decoder validates before its first pixel write. Keep the last valid
     // screen visible if this carousel object is malformed or unsupported.
-    Dab.discardSlideshow();
     if (displayModified) {
       // A render-pass failure cannot leave partial stripes/pixels as a valid
       // slideshow. Invalid input detected in validation still preserves GRAM.
@@ -973,12 +978,36 @@ bool renderSlideshowScreen() {
     markUiDirty(UI_DIRTY_STATUS);
     return false;
   }
-  // Keep the complete compressed object available so leaving and reopening
-  // the slideshow redraws the same image immediately. acknowledgeSlideshow()
-  // only releases collector ownership; the first segment of a genuinely new
-  // Transport ID will invalidate and reuse the single arena.
-  Dab.acknowledgeSlideshow();
+  // Cached reopen is immediate until a new body takes the reusable arena.
   return true;
+}
+
+void serviceUiSlideshow() {
+  if(Dab.takeSlideshowUpdate()) {
+    uiSlideshowDecodePending=true;markUiDirty(UI_DIRTY_STATUS);
+  }
+  if(!uiSlideshowDecodePending) return;
+  if(scanActive() || dabMode!=1 || uiSettings.slideshowMode==0) {
+    Dab.acknowledgeSlideshow();uiSlideshowDecodePending=false;return;
+  }
+  // A user may have opened the waiting view during collection. Keep that
+  // intent even if B equals A (content dedup then emits no new notification).
+  if(!Dab.slideshowAvailable()) return;
+  const bool visible=uiView==UiView::Slideshow;
+  const bool autoOpen=uiSettings.slideshowMode==2 && uiView==UiView::Text;
+  if(visible || autoOpen) {
+    const UiView previous=uiView;
+    uiView=UiView::Slideshow;uiSlideshowDecodePending=false;
+    serialMonitor.printf("[SLS/UI] rendering %lu bytes\n",
+                         static_cast<unsigned long>(Dab.slideshowLength()));
+    const bool rendered=renderSlideshowScreen();
+    if(!rendered && autoOpen && uiView!=previous) { uiView=previous;renderCurrentUiView(); }
+  } else {
+    // No render lease is held by a notification. Modal Auto may retain the
+    // intent to display the newest still-cached image after returning to Text.
+    Dab.acknowledgeSlideshow();
+    if(uiSettings.slideshowMode!=2) uiSlideshowDecodePending=false;
+  }
 }
 
 void renderCurrentUiView() {
@@ -1595,41 +1624,7 @@ void serviceUi(uint32_t now) {
     markUiDirty(UI_DIRTY_STATUS);
   }
   flushUiDirty();
-  if (Dab.takeSlideshowUpdate()) {
-    uiSlideshowDecodePending = true;
-    markUiDirty(UI_DIRTY_STATUS);
-  }
-
-  if (!scanActive() && uiSlideshowDecodePending && dabMode == 1 &&
-      uiSettings.slideshowMode != 0 && Dab.slideshowAvailable()) {
-    const bool alreadyVisible = uiView == UiView::Slideshow;
-    const bool canAutoOpen = uiSettings.slideshowMode == 2 &&
-                             uiView == UiView::Text;
-    const bool canDefaultOpen = false;
-    if (alreadyVisible || canAutoOpen || canDefaultOpen) {
-      // A completed image owns the single MOT arena until renderSlideshowScreen()
-      // calls discardSlideshow(). Continuous DSRV/INTB activity therefore
-      // cannot corrupt it and must not starve the decoder waiting for an
-      // artificial "quiet" period.
-      const UiView previousView = uiView;
-      if (canDefaultOpen) uiDefaultSlideshowPending = false;
-      if (canAutoOpen || canDefaultOpen) uiView = UiView::Slideshow;
-      uiSlideshowDecodePending = false;
-      serialMonitor.printf("[SLS/UI] rendering %lu bytes\n",
-                    static_cast<unsigned long>(Dab.slideshowLength()));
-      const bool rendered = renderSlideshowScreen();
-      if (!rendered && canAutoOpen) {
-        uiView = previousView;
-        renderCurrentUiView();
-      }
-    } else {
-      // Manual mode keeps the compressed image ready in RAM and decodes only
-      // when the user actually opens the SLS screen. Release exclusive UI
-      // ownership while retaining the cached image for SELECT.
-      Dab.acknowledgeSlideshow();
-      uiSlideshowDecodePending = false;
-    }
-  }
+  serviceUiSlideshow();
 
   if (scanActive() || uiView != UiView::Text) return;
 

@@ -27,6 +27,7 @@
 #endif
 #include "dab_scheduler_policy.h"
 #include "dab_service_switch_policy.h"
+#include "dab_audio_activation.h"
 #include "fm_features.h"
 #include "epg_discovery.h"
 #include "EpgConfig.h"
@@ -34,6 +35,19 @@
 constexpr uint8_t DAB_MAX_SERVICES = 32;
 constexpr uint16_t DAB_MAX_SERVICEDATA_LEN = 129;
 constexpr uint32_t DAB_SLS_ARENA_BYTES = 50UL * 1024UL;
+#ifndef FMDAB_MOT_DIAGNOSTICS
+#define FMDAB_MOT_DIAGNOSTICS 0
+#endif
+#if FMDAB_MOT_DIAGNOSTICS
+struct DabMotDiagnostics {
+  uint32_t validDsrv=0,dsrvBytes=0,maxBacklog=0,uniqueSegments=0,duplicates=0;
+  uint32_t renderBlocked=0,replayIgnored=0,retiredRejected=0,contextRejected=0;
+  uint32_t malformed=0,staleCompletion=0,overflow=0,waitForZero=0;
+  uint32_t firstAt=0,completeAt=0,notifiedAt=0,renderStartAt=0,renderEndAt=0;
+  uint32_t lastTaskAt=0,maxTaskGapMs=0;
+  bool taskSeen=false;
+};
+#endif
 
 extern const uint32_t dab_freq[];
 constexpr uint8_t DAB_FREQS = 38;
@@ -98,6 +112,8 @@ class DAB {
   bool requestDabTune(uint8_t frequencyIndex);
   bool requestDabService(uint8_t frequencyIndex, uint32_t serviceId, uint32_t componentId);
   bool requestDabServiceListRefresh();
+  void cancelAudioActivation();
+  bool audioActivationFailed() const;
   void setEpgDiscoveryEnabled(bool enabled);
   void requestVolume(uint8_t volume);
   void task();
@@ -179,6 +195,11 @@ class DAB {
   const fm_features::AfList& fmAfList() const;
   bool slideshowEnabled() const;
   bool slideshowAvailable() const;
+#if FMDAB_MOT_DIAGNOSTICS
+  const DabMotDiagnostics& slideshowDiagnostics() const { return _motDiagnostics; }
+#endif
+  uint32_t beginSlideshowRender();
+  void endSlideshowRender(uint32_t token, bool decoded);
   bool slideshowCollecting() const;
   bool slideshowReceiving(uint32_t now) const;
   uint8_t slideshowProgress() const;
@@ -219,6 +240,7 @@ class DAB {
     DabTuneCommand,
     DabTuneRetry,
     DabTuneWaitStc,
+    DabRfWait,
     DabStopDataServiceCommand,
     DabStopServiceCommand,
     DabStopRetry,
@@ -279,7 +301,10 @@ class DAB {
   void processEpgComponentReply(bool ok);
   void reportEpgDiscovery();
   void processFmStatusReply(bool acknowledgeStc);
-  void processDabStatusReply(bool acknowledgeStc);
+  bool processDabStatusReply(bool acknowledgeStc, size_t replyBytes=23);
+  bool audioRfFresh(uint32_t now) const;
+  bool scheduleAudioActivation(uint32_t now);
+  void rejectAudioStart(si468x::Result result);
   void resetDlsAssembler();
   void publishDlsSegments(uint8_t firstSegment, uint8_t lastSegment,
                           bool complete);
@@ -288,6 +313,10 @@ class DAB {
   void resetSlideshowAssembler(bool clearImage);
   void processMotPacket(const si468x::DsrvHeader& header,
                         const uint8_t* payload, uint16_t length);
+  void startSlideshowCollector(uint32_t tid,uint32_t sid,uint32_t cid);
+  bool slideshowTidRetired(uint32_t tid) const;
+  void retireSlideshowTid(uint32_t tid);
+  void seedSlideshowReplay(uint32_t sid,uint32_t cid);
   bool allSlideshowSegmentsReceived(uint16_t count) const;
   bool storeSlideshowSegment(uint16_t segment, const uint8_t* data,
                              uint16_t dataLength);
@@ -369,7 +398,7 @@ class DAB {
   uint32_t _componentId;
   uint32_t _activeServiceId;
   uint32_t _activeComponentId;
-  bool _activeServiceValid;
+  bool _activeServiceValid; // START accepted; decoder verification is separate.
   uint32_t _dataServiceId;
   uint32_t _dataComponentId;
   uint32_t _activeDataServiceId;
@@ -415,6 +444,10 @@ class DAB {
   fm_features::AfList _fmAfList;
   fm_features::ClockValidator _fmClockValidator;
   dab_switch::Controller _dabSwitch;
+  dab_audio::Activation _audioActivation;
+  uint32_t _rfGeneration=0,_rfSampleMs=0;
+  bool _rfParseOk=false,_audioRfCheck=false,_audioListKnown=false,_audioListVersionKnown=false;
+  uint16_t _audioListVersion=0;
   uint8_t _dlsSegments[8][16];
   uint8_t _dlsSegmentLengths[8];
   uint8_t _dlsReceivedMask;
@@ -454,11 +487,23 @@ class DAB {
   uint32_t _slideshowComponentId;
   uint32_t _slideshowGeneration;
   uint32_t _slideshowImageHash;
+  uint32_t _slideshowImageOffset=0;
+#if FMDAB_MOT_DIAGNOSTICS
+  DabMotDiagnostics _motDiagnostics;
+#endif
+  uint32_t _slideshowRenderSerial=0,_slideshowRenderToken=0,_slideshowRenderGeneration=0;
+  uint32_t _slideshowHeaderTid=0,_slideshowHeaderBodySize=0;
+  uint32_t _slideshowHistorySid=0,_slideshowHistoryCid=0,_slideshowHistoryGeneration=0;
+  uint32_t _slideshowRetired[8]={};
+  uint8_t _slideshowRetiredCount=0,_slideshowRetiredNext=0;
+  uint8_t _slideshowReplaySeen[(SLS_MAX_SEGMENTS+7)/8]={};
+  bool _slideshowCacheMapValid=false,_slideshowHeaderValid=false;
+  bool _slideshowReplayActive=false,_slideshowReplayLast=false;
   bool _slideshowEnabled;
   bool _slideshowCollecting;
   bool _slideshowAvailable;
   bool _slideshowUpdate;
-  bool _slideshowPublishedPending;
+  bool _slideshowPublishedPending; // notification mirror only; never an arena lock
   bool _slideshowCompletedTransportValid;
 
   uint32_t _irqCounter;

@@ -247,7 +247,7 @@ def main():
             subprocess.run([*common, *sources, '-o', str(executable)], check=True)
             subprocess.run([str(executable)], check=True, cwd=ROOT)
             print('PASS', name, flush=True)
-        radio_flags = ['-DFMDAB_HOST_TEST', '-Wno-error=switch',
+        radio_flags = ['-DFMDAB_HOST_TEST', '-DFMDAB_MOT_DIAGNOSTICS=1', '-Wno-error=switch',
                        '-I' + str(ROOT / 'tests/radio_shims'),
                        '-I' + str(ROOT / 'tests/host_shims'), '-I' + str(ROOT / 'src')]
         executable = directory / 'mot_driver.exe'
@@ -259,8 +259,24 @@ def main():
                                       cwd=ROOT, capture_output=True, check=True).stdout
             source = directory / 'baseline_driver.cpp'
             source.write_bytes(baseline)
+            header = subprocess.run(['git', 'show', f'{args.mot_baseline}:src/si4684.h'],
+                                    cwd=ROOT, capture_output=True, check=True).stdout.decode('utf-8')
+            # Test-only access; retain matching historical declarations/layout.
+            header = header.replace('class DAB {', 'class DAB {\n  friend struct DabHostAccess;', 1)
+            (directory / 'si4684.h').write_text(header, encoding='utf-8')
+            policy = subprocess.run(['git', 'show', f'{args.mot_baseline}:src/mot_assembly_policy.h'],
+                                    cwd=ROOT, capture_output=True, check=True).stdout
+            (directory / 'mot_assembly_policy.h').write_bytes(policy)
+            test = directory / 'baseline_test.cpp'
+            # Only the original delayed collector reproducer needs compiling
+            # against the old API; later lifecycle tests exercise new leases.
+            baseline_test = (ROOT / 'tests/test_mot_driver.cpp').read_text()
+            baseline_test = baseline_test[:baseline_test.index('  static void identities()')] + '};\nint main() { DabHostAccess::delayed(); }\n'
+            test.write_text(baseline_test.replace(
+                            '#include "../src/si4684.h"', '#include "si4684.h"').replace(
+                            '#include "../src/BusConfig.h"', '#include "BusConfig.h"'), encoding='utf-8')
             executable = directory / 'mot_baseline.exe'
-            subprocess.run([*common, *radio_flags, '-DFMDAB_MOT_BASELINE', str(ROOT / 'tests/test_mot_driver.cpp'),
+            subprocess.run([*common, '-I' + str(directory), *radio_flags, '-DFMDAB_MOT_BASELINE', str(test),
                             str(source), '-o', str(executable)], check=True)
             result = subprocess.run([str(executable)], capture_output=True)
             assert result.returncode != 0 and b'_slideshowReceivedBytes==608' in result.stderr

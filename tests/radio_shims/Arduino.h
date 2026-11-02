@@ -29,7 +29,8 @@ inline void digitalWrite(uint8_t pin,int value) {
 inline int digitalRead(uint8_t pin) { return hostPins[pin]; }
 inline void pinMode(uint8_t,int) {}
 inline unsigned digitalPinToInterrupt(uint8_t pin) { return pin; }
-inline void attachInterrupt(unsigned,void(*)(),int) {}
+inline void (*&hostInterruptHandler())() { static void (*handler)()=nullptr;return handler; }
+inline void attachInterrupt(unsigned,void(*handler)(),int) { hostInterruptHandler()=handler; }
 inline void noInterrupts() {}
 inline void interrupts() {}
 inline uint8_t pgm_read_byte(const uint8_t* pointer) { return *pointer; }

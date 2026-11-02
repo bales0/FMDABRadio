@@ -1342,10 +1342,10 @@ void handleRadioEvents() {
 
   // Deferred restored-station tune. Retry while a short background/volume
   // command owns the command channel; only give up after a real timeout.
-  if (uiBandStarting && uiInitialTuneDeferred && Dab.ready()) {
-    const bool accepted = dabMode == 1
+  if (uiBandStarting && uiInitialTuneDeferred) {
+    const bool accepted = Dab.ready() && (dabMode == 1
                               ? DAB_SetChannel()
-                              : FMsetChannel(currentFMchannel, true);
+                              : FMsetChannel(currentFMchannel, true));
     if (accepted) {
       uiInitialTuneDeferred = false;
       uiBandTunePending = true;
@@ -1485,6 +1485,7 @@ void beginFullScan() {
   }
 
   scanCancelRequested = false;
+  Dab.cancelAudioActivation();
   scanBandSwitchPending = false;
   scanDabIndex = 0;
   scanCommitIndex = 0;

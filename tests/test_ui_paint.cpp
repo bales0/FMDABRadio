@@ -29,7 +29,8 @@ struct Radio {
   bool dabplus=true,valid=true,fmPilot=true,rdsSync=true,tp=false,ta=false;
   uint16_t bitrate=64,samplerate=48000,pi=0x1234;
   uint8_t mode=2,pty=4,progress=95;
-  bool receiving=true,available=false;
+  bool receiving=true,available=false,audioFailed=false;
+  bool audioActivationFailed() const { return audioFailed; }
   Af af;
   uint32_t freq_khz(uint8_t) const { return 174928; }
   bool slideshowReceiving(uint32_t) const { return receiving; }
@@ -111,6 +112,11 @@ int main() {
   Dab.progress=96;redraw();assert(draws.size()==1 && draws[0].text=="96%");resetSpy();
   Dab.valid=false;redraw();assert(draws.size()==1 && draws[0].text=="RX");resetSpy();
   Dab.bitrate=128;redraw();assert(draws.size()==1 && draws[0].y==83);resetSpy();
+  Dab.bitrate=Dab.samplerate=0;redraw();
+  assert(draws.size()==1 && draws[0].text=="Audio loading...");resetSpy();
+  Dab.audioFailed=true;redraw();assert(draws.size()==1 && draws[0].text=="Audio unavailable");resetSpy();
+  Dab.audioFailed=false;Dab.bitrate=48;Dab.samplerate=48000;redraw();
+  assert(draws.size()==1 && draws[0].text.find("48kbit")!=std::string::npos);resetSpy();
   Dab.receiving=false;redraw();
   assert(draws.size()==2 && draws[0].text=="MOT" && draws[1].text=="--");resetSpy();
   Dab.available=true;redraw();

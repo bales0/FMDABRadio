@@ -88,3 +88,20 @@ Canvas objekt má 44 B BSS, obrazová data 260 B heap jednou při startu; převo
 používá 320 B dočasného řádku na stacku. Zbytek přírůstku BSS patří omezenému
 L1 inventory a jeho driver stavu. Programme Core stále není instancován.
 Aktuální podrobnosti: IMPLEMENTATION_REPORT_EPG_L1_TEXT.md.
+
+## Audio activation/recovery (2026-11-02)
+
+Default build proti čistému 1f19644: RAM 112192 → 112240 B (+48 B), flash
+457461 → 459501 B (+2040 B). Supervisor používá pevný stav, žádné nové heap
+alokace ani image buffery. Arény, canvas a sběrnicové takty beze změny.
+Host MOT časy jsou syntetické, heap/stack/RF za běhu na ESP32 neměřeny.
+Podrobnosti: IMPLEMENTATION_REPORT_AUDIO_RECOVERY_MOT.md.
+
+## Plynulý SLS/MOT karusel
+
+Default po této navazující etapě: RAM 112344 B, flash 460785 B. Proti
+rozpracované audio opravě +104 B / +1284 B. Nové položky jsou lease/token,
+32B replay bitmapa, osmičlenná TID historie a malé metadata; data zůstávají
+v jediné původní 51200B aréně. Nezavádí se heap alokace ani další image buffer.
+Volitelná diagnostika má měřených dalších 88 B statické RAM; default je 0.
+Podrobnosti, syntetické časování a HW limity: SLS_MOT_IMPLEMENTATION_REPORT_CZ.md.

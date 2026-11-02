@@ -105,3 +105,33 @@ demoted only for this driver harness, as in the MOT integration harness.
 LCD tests additionally execute the production mono-to-RGB transfer and check
 all 2080 pixels, row stride, one window, no pre-clear and allocation fallback.
 Current stage: IMPLEMENTATION_REPORT_EPG_L1_TEXT.md.
+
+## Audio activation and MOT A/B replay
+
+```powershell
+python tests/run_audio_tests.py
+python tests/run_mot_benchmark.py
+```
+
+Audio tests compile actual si4684.cpp with scripted SPI/time, plus extracted
+production app boot/deferred/result functions. They cover cold boot/image/XPAD,
+RF rechecks, 8+4 bounded STARTs, fresh-CID correction, one metadata recovery,
+cancel/generations, STOP paths and PAD-MOT after accepted/verified audio.
+The benchmark builds matching historical headers/drivers and current discovery
+ON/OFF in TEMP. It reports synthetic clock times and exact byte/hash checks,
+LAST-first/reverse/duplicates/corruption, multiple TIDs, 45/90/180s carousel gaps,
+IRQ/polling and a 421ms no-task model. It does not measure real RF/SPI speed,
+JPEG decoding time, hardware FIFO capacity or audible output. No COM/flash.
+See IMPLEMENTATION_REPORT_AUDIO_RECOVERY_MOT.md for budgets, results and HW plan.
+
+## Continuous SLS carousel
+
+Current lifecycle: SLS_MOT_IMPLEMENTATION_REPORT_CZ.md. The radio harness now
+tests an explicit render lease, any-first-segment TID transitions, exact cached
+replay/probe/compaction for recycled TIDs, late old identities, and IRQ/STATUS
+arriving during payload read. Notification/ACK does not pin the arena.
+The UI runner also compiles actual slideshow UI functions with the real driver
+for Manual/Auto/Off, modal/scan, partial reopen, same-content waiting, failures
+and immutable decoder input. Diagnostics are enabled only for the MOT host
+harness; the default firmware flag is 0 and emits no new periodic output.
+Historical replay now copies matching policy headers as well as driver/header.
