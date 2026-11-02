@@ -62,5 +62,23 @@ int main() {
   assert(decodedHeaderSize == encodedHeaderSize);
   assert(!decodeHeaderCore(headerCore, 6U, decodedBodySize,
                            decodedHeaderSize));
+  const uint8_t packed[] = {1U, 2U, 3U, 4U};
+  const uint8_t same[] = {3U, 4U};
+  const uint8_t conflict[] = {3U, 5U};
+  assert(duplicateMatches(packed, 4U, 2U, 2U, same, 2U));
+  assert(!duplicateMatches(packed, 4U, 2U, 2U, conflict, 2U));
+  assert(!duplicateMatches(packed, 4U, 2U, 1U, same, 2U));
+  assert(!duplicateMatches(packed, 4U, 3U, 2U, same, 2U));
+  assert(!duplicateMatches(packed, 4U, UINT32_MAX, 2U, same, 2U));
+  assert(!duplicateMatches(nullptr, 4U, 2U, 2U, same, 2U));
+  assert(!duplicateMatches(packed, 4U, 2U, 2U, nullptr, 2U));
+  assert(!duplicateMatches(packed, 4U, 2U, 0U, same, 0U));
+  assert(lastBoundaryValid(3U, true, 0U, 3U));
+  assert(!lastBoundaryValid(2U, true, 0U, 3U));
+  assert(lastBoundaryValid(3U, true, 4U, 3U));
+  assert(lastBoundaryValid(0U, false, 4U, 3U));
+  assert(!lastBoundaryValid(4U, false, 4U, 3U));
+  assert(!lastBoundaryValid(2U, true, 4U, 3U));
+  assert(lastBoundaryValid(255U, true, 256U, 255U));
   return 0;
 }

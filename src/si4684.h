@@ -81,6 +81,7 @@ class DAB {
   DAB();
 
   void configurePins(uint8_t chipSelect, uint8_t interrupt, uint8_t reset, uint8_t powerEnable);
+  void configureSharedSpiPeer(uint8_t peerChipSelectPin);
   void configureAudioPins(uint8_t gain0, uint8_t gain1);
   void configureFmBand(uint16_t bottom10kHz, uint16_t top10kHz,
                        uint8_t spacing10kHz, uint8_t deEmphasis);
@@ -304,6 +305,7 @@ class DAB {
   void (*_callback)(void);
 
   uint8_t _chipSelectPin;
+  uint8_t _peerChipSelectPin;
   uint8_t _interruptPin;
   uint8_t _resetPin;
   uint8_t _powerEnablePin;

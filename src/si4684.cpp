@@ -145,6 +145,7 @@ DAB::DAB()
       _diagnostics(nullptr),
       _callback(nullptr),
       _chipSelectPin(13),
+      _peerChipSelectPin(0xFF),
       _interruptPin(26),
       _resetPin(14),
       _powerEnablePin(2),
@@ -334,6 +335,14 @@ void DAB::configurePins(uint8_t chipSelect, uint8_t interrupt, uint8_t reset,
   // startup error on a cold boot.  Install the permanent Si4684 INTB handler
   // directly; GPIO26 is dedicated to INTB in this hardware.
   attachInterrupt(digitalPinToInterrupt(_interruptPin), onSi4684Intb, FALLING);
+}
+
+void DAB::configureSharedSpiPeer(uint8_t peerChipSelectPin) {
+  _peerChipSelectPin = peerChipSelectPin;
+  if (_peerChipSelectPin != 0xFF) {
+    pinMode(_peerChipSelectPin, OUTPUT);
+    digitalWrite(_peerChipSelectPin, HIGH);
+  }
 }
 
 void DAB::configureAudioPins(uint8_t gain0, uint8_t gain1) {
@@ -943,6 +952,9 @@ const fm_features::AfList& DAB::fmAfList() const { return _fmAfList; }
 bool DAB::writeCommand(void* context, uint8_t command, const uint8_t* args,
                        uint16_t length) {
   DAB* self = static_cast<DAB*>(context);
+  if (self->_peerChipSelectPin != 0xFF)
+    digitalWrite(self->_peerChipSelectPin, HIGH);
+  digitalWrite(self->_chipSelectPin, HIGH);
   SPI.beginTransaction(SPISettings(RADIO_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(self->_chipSelectPin, LOW);
   SPI.transfer(command);
@@ -957,6 +969,9 @@ bool DAB::writeCommand(void* context, uint8_t command, const uint8_t* args,
 bool DAB::readReply(void* context, uint8_t* destination, uint16_t length) {
   if (!destination || length < 4) return false;
   DAB* self = static_cast<DAB*>(context);
+  if (self->_peerChipSelectPin != 0xFF)
+    digitalWrite(self->_peerChipSelectPin, HIGH);
+  digitalWrite(self->_chipSelectPin, HIGH);
   SPI.beginTransaction(SPISettings(RADIO_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(self->_chipSelectPin, LOW);
   SPI.transfer(0x00);  // SPI framing byte; logical STATUS0 follows it.
@@ -1316,16 +1331,18 @@ void DAB::commandCompleted() {
     }
     if (_state == State::DabStopDataServiceCommand) {
       ++_commandErrors;
-      const bool alreadyStopped = result == si468x::Result::DeviceError &&
-                                  deviceReason == 0x03U;
+      const bool alreadyStopped = dab_switch::stopConfirmed(
+          false, result == si468x::Result::DeviceError, deviceReason);
       if (alreadyStopped) {
         diagnostic("[DAB/SWITCH] data STOP already inactive; continuing");
         _activeDataServiceValid = false;
         _dataServiceStopPending = false;
         _dabSwitch.stopRetries = 0U;
-        if (_serviceTransitionPending && _activeServiceValid) {
+        const dab_switch::State next = dab_switch::afterDataStop(
+            _serviceTransitionPending, _activeServiceValid);
+        if (next == dab_switch::State::StopAudio) {
           startDabStopCommand();
-        } else if (_serviceTransitionPending) {
+        } else if (next == dab_switch::State::ServiceSettle) {
           _serviceTransitionPending = false;
           _state = State::DabServiceSettle;
           _stateDeadlineMs = millis() + dab_switch::STOP_SETTLE_MS;
@@ -1348,8 +1365,8 @@ void DAB::commandCompleted() {
     }
     if (_state == State::DabStopServiceCommand) {
       ++_commandErrors;
-      const bool alreadyStopped = result == si468x::Result::DeviceError &&
-                                  deviceReason == 0x03U;
+      const bool alreadyStopped = dab_switch::stopConfirmed(
+          false, result == si468x::Result::DeviceError, deviceReason);
       if (alreadyStopped) {
         diagnostic("[DAB/SWITCH] audio STOP already inactive; continuing");
         _activeServiceValid = false;
@@ -1562,16 +1579,18 @@ void DAB::commandCompleted() {
       _state = State::DabTuneWaitStc;
       break;
 
-    case State::DabStopDataServiceCommand:
+    case State::DabStopDataServiceCommand: {
       diagnostic("[RADIO] DAB data service stopped SID=0x%08lX CID=0x%08lX",
                  static_cast<unsigned long>(_activeDataServiceId),
                  static_cast<unsigned long>(_activeDataComponentId));
       _activeDataServiceValid = false;
       _dataServiceStopPending = false;
       _dabSwitch.stopRetries = 0U;
-      if (_serviceTransitionPending && _activeServiceValid) {
+      const dab_switch::State next = dab_switch::afterDataStop(
+          _serviceTransitionPending, _activeServiceValid);
+      if (next == dab_switch::State::StopAudio) {
         startDabStopCommand();
-      } else if (_serviceTransitionPending) {
+      } else if (next == dab_switch::State::ServiceSettle) {
         _serviceTransitionPending = false;
         _state = State::DabServiceSettle;
         _stateDeadlineMs = millis() + dab_switch::STOP_SETTLE_MS;
@@ -1579,6 +1598,7 @@ void DAB::commandCompleted() {
         _state = State::Ready;
       }
       break;
+    }
 
     case State::DabStopServiceCommand:
       diagnostic("[RADIO] DAB service stopped SID=0x%08lX CID=0x%08lX",
@@ -2629,7 +2649,32 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
 
   const uint8_t mask = static_cast<uint8_t>(1U << (segment & 7U));
   uint8_t& bitmapByte = _slideshowSegmentBitmap[segment >> 3];
+  if (!mot_assembly::lastBoundaryValid(segment, last, _slideshowTotalSegments,
+                                       _slideshowHighestSegment)) {
+    diagnostic("[SLS][WARN] conflicting LAST object=%06lX seg=%u total=%u",
+               static_cast<unsigned long>(objectId), segment,
+               _slideshowTotalSegments);
+    resetSlideshowAssembler(true);
+    return;
+  }
   if ((bitmapByte & mask) != 0U) {
+    uint32_t offset = 0U;
+    for (uint16_t i = 0; i < segment; ++i) offset += _slideshowSegmentLengths[i];
+    if (!mot_assembly::duplicateMatches(_slideshowArena, _slideshowReceivedBytes,
+          offset, _slideshowSegmentLengths[segment], data, dataLength)) {
+      diagnostic("[SLS][WARN] conflicting duplicate object=%06lX seg=%u",
+                 static_cast<unsigned long>(objectId), segment);
+      resetSlideshowAssembler(true);
+      return;
+    }
+    _slideshowLastActivityMs = millis();
+    // An identical retransmission can carry a previously missing LAST flag.
+    if (last) _slideshowTotalSegments = segment + 1U;
+    if (_slideshowTotalSegments != 0U &&
+        allSlideshowSegmentsReceived(_slideshowTotalSegments)) {
+      finishSlideshowObject();
+      return;
+    }
     // Some broadcasters omit LAST. Repeated segment zero marks the next
     // carousel cycle, so a contiguous object collected before it is complete.
     const bool precedingSegmentsComplete =

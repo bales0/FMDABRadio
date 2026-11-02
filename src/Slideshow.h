@@ -20,6 +20,7 @@ bool initializeSlideshowRenderer(Stream* diagnostics = nullptr);
 bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
                         uint32_t length, int16_t x, int16_t y,
                         int16_t width, int16_t height,
-                        Stream* diagnostics = nullptr);
+                        Stream* diagnostics = nullptr,
+                        bool* displayModified = nullptr);
 
 #endif

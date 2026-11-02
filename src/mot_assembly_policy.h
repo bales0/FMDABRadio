@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 
 namespace mot_assembly {
 
@@ -58,6 +59,24 @@ inline bool repeatedZeroCompletes(bool duplicate, uint16_t segment,
                                   bool precedingSegmentsComplete) {
   return duplicate && segment == 0U && knownTotal == 0U &&
          highestSegment > 0U && precedingSegmentsComplete;
+}
+
+// Compare a retransmitted segment with the packed bytes before treating it as
+// harmless repetition. Adapted from reference acceptSlideshowDuplicate(); the
+// caller validates the bitmap index before computing this packed offset.
+inline bool duplicateMatches(const uint8_t* arena, uint32_t receivedBytes,
+                              uint32_t offset, uint16_t storedLength,
+                              const uint8_t* incoming, uint16_t length) {
+  return arena && incoming && length != 0U && length == storedLength &&
+         offset <= receivedBytes && length <= receivedBytes - offset &&
+         memcmp(arena + offset, incoming, length) == 0;
+}
+
+inline bool lastBoundaryValid(uint16_t segment, bool last,
+                              uint16_t knownTotal, uint16_t highestSegment) {
+  if (knownTotal != 0U)
+    return segment < knownTotal && (!last || segment + 1U == knownTotal);
+  return !last || segment >= highestSegment;
 }
 
 }  // namespace mot_assembly

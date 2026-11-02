@@ -188,6 +188,30 @@ static void testCorruptAndUnsupportedInputs() {
   std::vector<uint8_t> workspace(76800U);
   JPEGImageInfo info;
 
+  std::vector<uint8_t> missingEoi = original;
+  assert(missingEoi[missingEoi.size() - 2U] == 0xFFU &&
+         missingEoi.back() == 0xD9U);
+  missingEoi.pop_back();
+  assert(JPEGpreflight(missingEoi.data(), missingEoi.size(), 160, 128, info) ==
+         JPEGPreflightResult::InvalidJpeg);
+  assert(!JPEGvalidate(original.data(), original.size(), 160, 128,
+                       workspace.data(), 1U, &info));
+  assert(JPEGpreflight(original.data(), original.size(), 0, 128, info) ==
+         JPEGPreflightResult::UnsupportedDimensions);
+
+  std::vector<uint8_t> invalidQuantIndex = original;
+  const size_t quantFrame = findMarker(invalidQuantIndex, 0xC0U);
+  assert(quantFrame + 12U < invalidQuantIndex.size());
+  invalidQuantIndex[quantFrame + 12U] = 4U;
+  assert(!JPEGvalidate(invalidQuantIndex.data(), invalidQuantIndex.size(),
+                       160, 128, workspace.data(), workspace.size(), &info));
+  std::vector<uint8_t> invalidHuffmanIndex = original;
+  const size_t tableScan = findMarker(invalidHuffmanIndex, 0xDAU);
+  assert(tableScan + 6U < invalidHuffmanIndex.size());
+  invalidHuffmanIndex[tableScan + 6U] = 0x44U;
+  assert(!JPEGvalidate(invalidHuffmanIndex.data(), invalidHuffmanIndex.size(),
+                       160, 128, workspace.data(), workspace.size(), &info));
+
   std::vector<uint8_t> earlyEoi = original;
   const size_t sos = findMarker(earlyEoi, 0xDAU);
   assert(sos < earlyEoi.size());

@@ -91,6 +91,16 @@ inline bool audioPadSlsContextValid(bool activeAudio,
   return activeAudio && !separateDataTargetFound;
 }
 
+// A STOP acknowledgement includes the documented "already inactive" reply.
+inline bool stopConfirmed(bool commandOk, bool deviceError, uint8_t reason) {
+  return commandOk || (deviceError && reason == 0x03U);
+}
+
+inline State afterDataStop(bool transitionPending, bool activeAudio) {
+  if (!transitionPending) return State::Ready;
+  return activeAudio ? State::StopAudio : State::ServiceSettle;
+}
+
 inline State dispatchRequest(bool activeData, bool activeAudio,
                              bool tuneRequested, bool serviceRequested) {
   if (activeData) return State::StopData;

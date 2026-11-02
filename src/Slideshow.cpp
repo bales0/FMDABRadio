@@ -1,6 +1,7 @@
 #include "Slideshow.h"
 
 #include "JPEGdecoder.h"
+#include "PngAdam7Scale.h"
 #include <PNGdec.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -17,6 +18,8 @@ constexpr uint16_t SLS_MAX_SOURCE_WIDTH = 2048;
 // This mirrors the proven RAM layout of SI4684-FMDAB-Receiver and avoids two
 // large adjacent heap allocations (sizeof(PNG) + JPEG workspace).
 constexpr size_t DECODER_WORKSPACE_BYTES = 76800U;
+static_assert(DECODER_WORKSPACE_BYTES == PngAdam7ArenaBytes,
+              "All image decoders must share the same arena contract");
 static_assert(sizeof(PNG) <= DECODER_WORKSPACE_BYTES,
               "PNG decoder does not fit in the shared workspace");
 uint8_t* decoderWorkspace = nullptr;
@@ -66,7 +69,16 @@ void jpegOutput(void* opaque, int32_t x, int32_t y, int32_t width,
   delay(0);
 }
 
-void jpegProgress(void*) {
+struct JpegProgress {
+  uint32_t rows = 0U;
+};
+
+void jpegProgress(void* opaque) {
+  if (opaque) ++static_cast<JpegProgress*>(opaque)->rows;
+  yield();
+}
+
+void adam7Progress(void*) {
   yield();
 }
 
@@ -116,6 +128,19 @@ void logDecode(Stream* diagnostics, const char* format, ...) {
   diagnostics->println(message);
 }
 
+void logResources(Stream* diagnostics, const char* phase) {
+  constexpr unsigned internal8 = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  constexpr unsigned internal32 = MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT;
+  logDecode(diagnostics,
+            "[SLS/RAM] %s i8=%u/%u i32=%u/%u min8=%u stackHwm=%u",
+            phase, static_cast<unsigned>(heap_caps_get_free_size(internal8)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(internal8)),
+            static_cast<unsigned>(heap_caps_get_free_size(internal32)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(internal32)),
+            static_cast<unsigned>(heap_caps_get_minimum_free_size(internal8)),
+            static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+}
+
 }  // namespace
 
 bool initializeSlideshowRenderer(Stream* diagnostics) {
@@ -132,22 +157,28 @@ bool initializeSlideshowRenderer(Stream* diagnostics) {
                                                MALLOC_CAP_8BIT));
     return false;
   }
-  logDecode(diagnostics,
-            "[SLS] shared decoder workspace allocated once: %u bytes, PNG=%u, free=%u largest=%u",
-            static_cast<unsigned>(DECODER_WORKSPACE_BYTES),
-            static_cast<unsigned>(sizeof(PNG)),
-            ESP.getFreeHeap(),
-            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                             MALLOC_CAP_8BIT));
+  // Allocation metrics belong to startup, not every subsequent render.
+  static bool reported = false;
+  if (!reported) {
+    logDecode(diagnostics,
+              "[SLS] shared decoder=%u PNG=%u Adam7=%u stripe=%u free=%u largest=%u",
+              static_cast<unsigned>(DECODER_WORKSPACE_BYTES),
+              static_cast<unsigned>(sizeof(PNG)),
+              static_cast<unsigned>(PngAdam7WorkspaceBytes()),
+              static_cast<unsigned>(PngAdam7TileBytes), ESP.getFreeHeap(),
+              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    reported = true;
+  }
   return true;
 }
 
 bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
                         uint32_t length, int16_t x, int16_t y,
                         int16_t width, int16_t height,
-                        Stream* diagnostics) {
+                        Stream* diagnostics, bool* displayModified) {
+  if (displayModified) *displayModified = false;
   if (data == nullptr || length < 8 || width <= 0 || height <= 0 ||
-      width > 160) {
+      width > 160 || height > 128 || length > PngAdam7MaxFileBytes) {
     return false;
   }
   if (!initializeSlideshowRenderer(diagnostics)) return false;
@@ -174,6 +205,7 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
             ESP.getFreeHeap(),
             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+  logResources(diagnostics, "before");
   if (jpeg) {
     JPEGImageInfo info;
     const JPEGPreflightResult preflight =
@@ -184,19 +216,73 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
     // Decode the complete entropy stream without touching the display first.
     // A corrupt or unsupported object therefore leaves the previous pixels
     // intact. The same bounded workspace is reused for the render pass.
-    if (supported && JPEGvalidate(data, length, 160, 128, decoderWorkspace,
-                                  DECODER_WORKSPACE_BYTES, &info,
-                                  jpegProgress, nullptr)) {
+    JpegProgress validationProgress, renderProgress;
+    const uint32_t validationStart = millis();
+    const bool validated = supported && JPEGvalidate(
+        data, length, 160, 128, decoderWorkspace, DECODER_WORKSPACE_BYTES,
+        &info, jpegProgress, &validationProgress);
+    const uint32_t validatedAt = millis();
+    if (validated) {
       JPEGDisplay output(jpegOutput, &display);
+      if (displayModified) *displayModified = true;
       display.fillScreen(ST77XX_BLACK);
       success = JPEGdecoder(data, length, output, 160, 128, decoderWorkspace,
                             DECODER_WORKSPACE_BYTES, &info,
-                            jpegProgress, nullptr);
+                            jpegProgress, &renderProgress);
     }
+    logDecode(diagnostics,
+              "[SLS/JPEG] scans=%u renderedMCUrows=%d pumps=%lu/%lu validate=%lums render=%lums",
+              info.scans, static_cast<int>(info.lastRenderedMcuRow)+1,
+              static_cast<unsigned long>(validationProgress.rows),
+              static_cast<unsigned long>(renderProgress.rows),
+              static_cast<unsigned long>(validatedAt-validationStart),
+              static_cast<unsigned long>(millis()-validatedAt));
     if (!success) {
       logDecode(diagnostics, "[SLS][WARN] JPEG rejected: %s size=%ux%u",
                 JPEGpreflightName(preflight), info.width, info.height);
     }
+  } else if (png && length >= 33U && data[28] == 1U) {
+    // Decode to bounded stripes, never drawing sparse intermediate passes.
+    // Reserve the tail of the SAME arena, disjoint from aligned inflater state.
+    constexpr size_t stateCapacity = DECODER_WORKSPACE_BYTES - PngAdam7TileBytes;
+    PngAdam7Info info;
+    const uint32_t validationStart = millis();
+    success = PngAdam7Decode(data, length, decoderWorkspace, stateCapacity,
+                             PngAdam7MaxWidth, PngAdam7MaxHeight, info,
+                             nullptr, nullptr, adam7Progress);
+    const uint32_t validatedAt = millis();
+    PngAdam7Tile tile;
+    unsigned decodePasses = 1U;
+    if (success) success = tile.fit(info.width, info.height, width, height);
+    if (success) {
+      tile.pixels = reinterpret_cast<uint16_t*>(decoderWorkspace + stateCapacity);
+      const int destinationX = x + (width - static_cast<int>(tile.width)) / 2;
+      const int destinationY = y + (height - static_cast<int>(tile.height)) / 2;
+      // Published MOT bytes remain immutable for all passes. The pump only
+      // yields; it never runs radio commands or invokes another image decoder.
+      for (tile.top = 0; tile.top < tile.height; tile.top += tile.rows) {
+        tile.rows = min(PngAdam7TileRows, tile.height - tile.top);
+        memset(tile.pixels, 0, PngAdam7TileBytes);
+        ++decodePasses;
+        success = PngAdam7Decode(data, length, decoderWorkspace, stateCapacity,
+                                  PngAdam7MaxWidth, PngAdam7MaxHeight, info,
+                                  PngAdam7Tile::collect, &tile, adam7Progress);
+        if (!success) break;
+        if (tile.top == 0U) {
+          if (displayModified) *displayModified = true;
+          display.fillScreen(ST77XX_BLACK);
+        }
+        display.drawRGBBitmap(destinationX, destinationY + tile.top,
+                              tile.pixels, tile.width, tile.rows);
+        yield(); // outside Adafruit's SPI transaction
+      }
+    }
+    logDecode(diagnostics,
+              "[SLS/Adam7] %s %ux%u depth=%u type=%u stage=%s pass=%u row=%u runs=%u validate=%lums render=%lums",
+              success ? "OK" : "rejected", info.width, info.height, info.depth,
+              info.type, info.stage, info.pass, info.row, decodePasses,
+              static_cast<unsigned long>(validatedAt-validationStart),
+              static_cast<unsigned long>(millis()-validatedAt));
   } else if (png) {
     // First pass validates every compressed scanline without touching TFT.
     PNG* decoder = new (decoderWorkspace) PNG();
@@ -223,6 +309,7 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
     }
     decoder->~PNG();
     if (success) {
+      if (displayModified) *displayModified = true;
       display.fillScreen(ST77XX_BLACK);
       decoder = new (decoderWorkspace) PNG();
       success = false;
@@ -244,6 +331,7 @@ bool renderRamSlideshow(Adafruit_ST7735& display, const uint8_t* data,
             success ? "OK" : "failed",
             static_cast<unsigned long>(millis() - startedAt), ESP.getFreeHeap(),
             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  logResources(diagnostics, "after");
   decoderBusy = false;
   return success;
 }

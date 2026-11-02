@@ -885,6 +885,7 @@ void renderUiStatus() {
 }
 
 void renderListeningScreen() {
+  prepareTftSpi();
   uiView = UiView::Text;
   resetUiStationScroll();
   clearScreen();
@@ -895,6 +896,7 @@ void renderListeningScreen() {
 }
 
 bool renderSlideshowScreen() {
+  prepareTftSpi();
   uiView = UiView::Slideshow;
   if (dabMode != 1 || uiSettings.slideshowMode == 0) {
     clearScreen();
@@ -909,14 +911,20 @@ bool renderSlideshowScreen() {
     uiSlideshowDecodePending = true;
     return true;
   }
+  bool displayModified = false;
   const bool decoded = renderRamSlideshow(
       tft, Dab.slideshowData(), Dab.slideshowLength(), 0, 0,
-      screenWidth, screenHeight, &serialMonitor);
+      screenWidth, screenHeight, &serialMonitor, &displayModified);
   uiSlideshowDecodePending = false;
   if (!decoded) {
     // The decoder validates before its first pixel write. Keep the last valid
     // screen visible if this carousel object is malformed or unsupported.
     Dab.discardSlideshow();
+    if (displayModified) {
+      // A render-pass failure cannot leave partial stripes/pixels as a valid
+      // slideshow. Invalid input detected in validation still preserves GRAM.
+      renderListeningScreen();
+    }
     markUiDirty(UI_DIRTY_STATUS);
     return false;
   }
@@ -939,6 +947,7 @@ void renderCurrentUiView() {
 
 void flushUiDirty() {
   if (uiDirtyFlags == UI_DIRTY_NONE || scanActive()) return;
+  prepareTftSpi();
   const uint8_t dirty = uiDirtyFlags;
   uiDirtyFlags = UI_DIRTY_NONE;
   if ((dirty & UI_DIRTY_FULL) != 0) {
@@ -1148,6 +1157,7 @@ void cycleUiScreen() {
 
 void renderStationList() {
   if (uiView != UiView::StationList) return;
+  prepareTftSpi();
   const uint16_t total = currentUiStationCount();
   const bool full = !stationListPainted || stationListWasEmpty != (total == 0);
   if (full) {
@@ -1270,6 +1280,7 @@ void tuneStationListSelection() {
 
 void renderMenu() {
   if (uiView != UiView::Menu) return;
+  prepareTftSpi();
   const bool full = !menuPainted;
   const bool styleChanged = full || paintedMenuLanguage != uiSettings.language ||
       paintedMenuTheme != uiSettings.theme;
@@ -1433,6 +1444,20 @@ void openSettingsMenu() {
   menuTop = 0;
   menuFmRegionOnOpen = sanitizeFmRegion(uiSettings.fmRegion);
   renderMenu();
+}
+
+void redrawLcdDiagnostic() {
+  // Preserve the active modal view and invalidate its partial-redraw cache.
+  uiDirtyFlags = UI_DIRTY_NONE;
+  if (uiView == UiView::Menu) {
+    menuPainted = false;
+    renderMenu();
+  } else if (uiView == UiView::StationList) {
+    stationListPainted = false;
+    renderStationList();
+  } else {
+    renderCurrentUiView();
+  }
 }
 
 void closeSettingsMenu() {

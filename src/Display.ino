@@ -115,5 +115,6 @@ void ServiceData(void)
 
 void clearScreen(void) 
 {
+  prepareTftSpi();
   tft.fillScreen(ST77XX_BLACK);
 }

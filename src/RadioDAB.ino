@@ -595,6 +595,14 @@ void applyFmRegionSelection() {
 
 constexpr uint32_t LCD_POWER_SETTLE_MS = 180U;
 constexpr uint32_t LCD_POST_SPI_SETTLE_MS = 20U;
+// Stabilization clock for shared SPI hardware. Test 16 MHz later; do not use
+// 32 MHz until signal integrity and LCD stability are confirmed on the board.
+constexpr uint32_t TFT_SPI_HZ = 8000000UL;
+
+void prepareTftSpi() {
+  digitalWrite(slaveSelectPin, HIGH);
+  digitalWrite(TFT_CS, HIGH);
+}
 
 void prepareColdBootPins() {
   // Establish all externally visible levels before starting Serial, I2C or SPI.
@@ -620,7 +628,8 @@ void prepareColdBootPins() {
 }
 
 void initializeDisplayDeterministic() {
-  // Do not call initR() twice. With TFT_RST=-1 a second initR() is only another
+  // Do not call initR() twice during startup. With TFT_RST=-1 another initR()
+  // (available only through manual LCDRESET) is only another
   // software reset; it cannot repair a marginal hardware POR and can itself
   // create a white-screen window. One init is issued only after the supply has
   // had ample time to settle, while the Si4684 remains held in reset.
@@ -636,6 +645,7 @@ void initializeDisplayDeterministic() {
   delay(LCD_POST_SPI_SETTLE_MS);
 
   tft.initR(INITR_BLACKTAB);
+  tft.setSPISpeed(TFT_SPI_HZ);
   tft.setRotation(3);
   tft.setTextWrap(false);
   tft.fillScreen(ST77XX_BLACK);
@@ -649,6 +659,7 @@ void setup() {
   prepareColdBootPins();
   backlight.begin(backlightPin, millis());
   Dab.configurePins(slaveSelectPin, interruptPin, resetPin, pwen);
+  Dab.configureSharedSpiPeer(TFT_CS);
   Dab.configureAudioPins(amplifierG0Pin, amplifierG1Pin);
 
   serialMonitor.begin(115200);
@@ -888,7 +899,25 @@ void executeSerialCommand(char* command) {
     if (*p >= 'a' && *p <= 'z') *p = static_cast<char>(*p - 'a' + 'A');
   }
   if (strcmp(command, "HELP") == 0) {
-    serialMonitor.println("$HELP STATUS LIST MODE=FM|DAB TUNE=n SEEK=UP|DOWN SERVICE=n VOLUME=0..75 AF=0|1 VIEW=TEXT|SLS DEBUG");
+    serialMonitor.println("$HELP STATUS LIST MODE=FM|DAB TUNE=n SEEK=UP|DOWN SERVICE=n VOLUME=0..75 AF=0|1 VIEW=TEXT|SLS DEBUG LCDREDRAW LCDRESET");
+  } else if (strcmp(command, "LCDREDRAW") == 0 ||
+             strcmp(command, "LCDRESET") == 0) {
+    // initR is a blocking diagnostic operation; never run it while a radio
+    // command or scan is waiting for service. Runtime recovery stays radio-only.
+    if (!Dab.ready() || scanActive() || uiBandStarting || fmAfActive()) {
+      serialMonitor.println("!ERR BUSY");
+      return;
+    }
+    prepareTftSpi();
+    if (strcmp(command, "LCDRESET") == 0) {
+      tft.initR(INITR_BLACKTAB);
+      tft.setSPISpeed(TFT_SPI_HZ);
+      tft.setRotation(3);
+      tft.setTextWrap(false);
+    }
+    redrawLcdDiagnostic();
+    serialMonitor.println(strcmp(command, "LCDRESET") == 0
+                              ? "!OK LCDRESET" : "!OK LCDREDRAW");
   } else if (strcmp(command, "STATUS") == 0) {
     printSerialStatus();
   } else if (strcmp(command, "LIST") == 0) {
@@ -1236,6 +1265,9 @@ void refreshStoredDabMuxLabels() {
 
 void handleRadioEvents() {
   if (Dab.takeBandReady()) {
+    // Every image boot, including radio recovery, invalidates the device's
+    // volume register. Apply it here once, even when opening an empty list.
+    Dab.requestVolume(scanActive() ? 0 : vol);
     showSi4684FirmwareVersion(70);
     serialMonitor.printf("[APP] %s image ready; Si%u firmware %u.%u.%u\n",
                   dabMode == 1 ? "DAB" : "FM", Dab.PartNo,
@@ -2048,7 +2080,6 @@ bool DAB_SetChannel(void)
 {
   if (!DABreadEEPROM(currentDABchannel)) return false;
   clearUiBroadcastState();
-  Dab.requestVolume(vol);
   const bool accepted = Dab.requestDabService(ensemble, serviceid, compid);
   // requestDabService() invalidates codec/audio metadata synchronously. Render
   // afterwards so even the first frame cannot show the previous station's
@@ -2079,7 +2110,6 @@ bool FMsetChannel(uint8_t FMchannel, bool flag)
   }
   clearUiBroadcastState();
   if (!uiBandStarting) renderListeningScreen();
-  Dab.requestVolume(vol);
   stationFM = 100 * stationFM_h + stationFM_l * 10;
   const bool accepted = Dab.requestFmTune(stationFM);
   if (!accepted) {
