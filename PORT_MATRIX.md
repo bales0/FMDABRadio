@@ -109,3 +109,25 @@ uveden v souborech včetně SHA. Zachována závislost PNGdec 1.1.6 (Apache-2.0;
 vložený inflater má vlastní zlib notice); nebyla přibalena nová kopie inflateru
 ani měněny licenční hlavičky knihovny. Malý table-free CRC32 helper je připraven
 ke sdílení s případným budoucím EPG, bez duplikace CRC tabulky.
+
+## Navazující schválená etapa EPG L0 / LCD (2026-11-02)
+
+Aktuální stav nahrazuje dřívější odklad samotného headless core; podrobnosti
+v IMPLEMENTATION_REPORT_EPG_L0_LCD.md. Reference nyní
+`df0c8bc9eef4c4598742fd462216675d1e885d81`.
+
+| Oblast | Rozhodnutí | Výsledek |
+| --- | --- | --- |
+| EPG core/time/cache/CRC | PORT | byte DRAM, OOM cleanup, bounded allocations, saturace statistik, oprava SCIdS |
+| Replay fixtures/testy | PORT | historický demo replay a synthetic multi-TID, bez velkého RAW oracle |
+| Live discovery/routing/scheduler/clock | DEFER | žádné tuner příkazy ani instance Core |
+| EPG UI/serial/runtime ON | DEFER | EPG_ENABLE=1 je pouze compile opt-in |
+| Logo decoder integration | DEFER | pouze komprimovaný buffer v neaktivním core API |
+| LCD dirty flags | LEAVE + rozšířit | cache jednotlivých polí, statické texty se nepřekreslují |
+| Menu/list ovládání | LEAVE | vlastní dílčí rendering, žádná Tech/Tune stránka |
+
+Navazující souhlas: L1 discovery je nyní PORT/ADAPT (UA parser reference,
+vlastní omezené inventory a kooperativní integrace target driveru). Live
+acquisition/ingress do Core, Now/Next a EPG TFT/serial UI zůstávají DEFER.
+Reference textový sprite princip je ADAPT na jednobitový 260 B canvas.
+Aktuální mapa datových cest a omezení: IMPLEMENTATION_REPORT_EPG_L1_TEXT.md.

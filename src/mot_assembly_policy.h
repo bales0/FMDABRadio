@@ -5,6 +5,14 @@
 
 namespace mot_assembly {
 
+// Activity indication only: expiry must never discard a partial carousel.
+constexpr uint32_t RECEPTION_ACTIVITY_MS = 30000U;
+inline bool receptionActive(bool collecting, uint32_t lastAcceptedMs,
+                             uint32_t now) {
+  return collecting && static_cast<uint32_t>(now - lastAcceptedMs) <
+                           RECEPTION_ACTIVITY_MS;
+}
+
 inline bool segmentInRange(uint16_t segment, uint16_t maxSegments) {
   return segment < maxSegments;
 }

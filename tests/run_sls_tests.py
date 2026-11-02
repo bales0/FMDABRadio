@@ -11,6 +11,9 @@ import struct
 import subprocess
 import tempfile
 import zlib
+import sys
+sys.dont_write_bytecode = True
+from test_bus_build import check as check_bus_build
 
 ROOT = Path(__file__).resolve().parents[1]
 PASSES = [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
@@ -184,6 +187,8 @@ def main():
     parser.add_argument('--cxx', default='g++')
     parser.add_argument('--cc', default='gcc')
     parser.add_argument('--sanitize', action='store_true')
+    parser.add_argument('--mot-baseline', metavar='SHA',
+                        help='also verify that the old real driver fails the delayed-segment regression')
     args = parser.parse_args()
     lib = ROOT / '.pio/libdeps/FMDABRadio/PNGdec/src'
     if not lib.is_dir():
@@ -234,7 +239,7 @@ def main():
                         '-o', str(executable)], check=True)
         subprocess.run([str(executable), str(directory / '6_8_320_320.png'),
                         str(directory / 'standard_6_8.png')], check=True, cwd=ROOT)
-        for name in ['radio_scheduler', 'fm_features', 'dab_service_switch', 'mot_assembly', 'jpeg']:
+        for name in ['radio_scheduler', 'fm_features', 'dab_service_switch', 'mot_assembly', 'jpeg', 'bus_config']:
             sources = [str(ROOT / f'tests/test_{name}.cpp')]
             if name == 'jpeg':
                 sources += [str(ROOT / 'src/JPEGdecoder.cpp')]
@@ -242,6 +247,25 @@ def main():
             subprocess.run([*common, *sources, '-o', str(executable)], check=True)
             subprocess.run([str(executable)], check=True, cwd=ROOT)
             print('PASS', name, flush=True)
+        radio_flags = ['-DFMDAB_HOST_TEST', '-Wno-error=switch',
+                       '-I' + str(ROOT / 'tests/radio_shims'),
+                       '-I' + str(ROOT / 'tests/host_shims'), '-I' + str(ROOT / 'src')]
+        executable = directory / 'mot_driver.exe'
+        subprocess.run([*common, *radio_flags, str(ROOT / 'tests/test_mot_driver.cpp'),
+                        str(ROOT / 'src/si4684.cpp'), '-o', str(executable)], check=True)
+        subprocess.run([str(executable)], check=True)
+        if args.mot_baseline:
+            baseline = subprocess.run(['git', 'show', f'{args.mot_baseline}:src/si4684.cpp'],
+                                      cwd=ROOT, capture_output=True, check=True).stdout
+            source = directory / 'baseline_driver.cpp'
+            source.write_bytes(baseline)
+            executable = directory / 'mot_baseline.exe'
+            subprocess.run([*common, *radio_flags, '-DFMDAB_MOT_BASELINE', str(ROOT / 'tests/test_mot_driver.cpp'),
+                            str(source), '-o', str(executable)], check=True)
+            result = subprocess.run([str(executable)], capture_output=True)
+            assert result.returncode != 0 and b'_slideshowReceivedBytes==608' in result.stderr
+            print('PASS baseline reproducer: old driver loses partial object after 45 seconds', flush=True)
+        check_bus_build(args.cxx, directory, common)
 
 
 if __name__ == '__main__':

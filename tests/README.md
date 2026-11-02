@@ -7,6 +7,30 @@ pio run
 python tests/run_sls_tests.py
 ```
 
+The suite also compiles the real `src/si4684.cpp` against `radio_shims` and feeds
+binary DSRV frames with a deterministic clock. It verifies a missing interior
+MOT segment after 45/90/180 seconds, repeated carousels, millis wrap, context
+invalidation, published ownership, bounds, SPI CS ordering and framing. Bus
+configuration tests reject overclock overrides and check the build-local
+Adafruit initR default-frequency adaptation. These are not electrical tests.
+
+Optional verification of the original 30-second loss on the actual old driver:
+
+```powershell
+python tests/run_sls_tests.py --mot-baseline 28097fdd1ed8dbc6414f21884738896c6db230d5
+```
+
+The baseline driver is read with `git show` into TEMP; the working tree is not
+checked out or modified. The expected specific failed assertion confirms that
+the old driver discards the 608-byte partial object after the first 45s pause.
+The radio-driver integration build demotes only the pre-existing `Aborted`
+enum switch warning from an error; all other host warnings stay errors.
+
+LCD activity regression also checks 29999/30000ms, timestamp zero and millis
+wrap. Invalid/foreign packets cannot refresh reception; valid headers and
+duplicates can. Expiry preserves the 608-byte partial object and its 95% stored
+progress, while completed cached images stay available independently of time.
+
 The runner compiles the exact PNGdec 1.1.6 inflater from PlatformIO libdeps.
 Generated independent Adam7 fixtures and all executables are temporary and do
 not modify tracked assets. It covers 92 valid and 197 hostile Adam7 inputs,
@@ -51,3 +75,33 @@ the delayed/bounded DAB audio-info retry schedule.
 
 The JPEG fixtures are deterministic assets copied with the progressive decoder
 from `SI4684-FMDAB-Receiver` revision `5b88340d3ef32208cc7bff7d05de6a89a5e844dc`.
+
+## EPG L0 and LCD field repaint (2026-11-02)
+
+```powershell
+python tests/run_epg_tests.py
+python tests/run_ui_tests.py
+```
+
+Both runners compile into TEMP with C++11 warnings as errors and use no COM,
+network, EEPROM or hardware. EPG tests enable the headless module only: replay,
+cache pressure, multi-TID, hostile input, OOM, allocation counts, bearer identity,
+clock confidence/offset and wrap. Fixture provenance is in fixtures/epg/README.md.
+The full large RAW corpus/oracle is not part of this run.
+
+LCD tests extract the actual production render functions and observe TFT writes:
+100 unchanged redraw requests write nothing; individual changes touch their own
+fields, pixel scrolling only the DLS strip, and invalidation reconstructs the view.
+This is not a physical display flicker or timing measurement.
+
+`measure_epg_target.cpp` is a compile-only Xtensa layout probe, never firmware.
+See IMPLEMENTATION_REPORT_EPG_L0_LCD.md for target RAM and integration limits.
+
+The EPG runner now also tests L1 discovery against the actual si4684.cpp with
+host SPI: all-component inventory, UA padding/length, exact command CID,
+stale replies, disabled/ON/OFF builds, priorities and timeout without recovery.
+No real tuner/COM is accessed. The existing Aborted enum switch warning is
+demoted only for this driver harness, as in the MOT integration harness.
+LCD tests additionally execute the production mono-to-RGB transfer and check
+all 2080 pixels, row stride, one window, no pre-clear and allocation fallback.
+Current stage: IMPLEMENTATION_REPORT_EPG_L1_TEXT.md.

@@ -52,7 +52,7 @@ void writeSettingsSchema() {
 }
 void startEEPROM(){
    Wire.begin();
-   Wire.setClock(400000);
+   Wire.setClock(board_bus::EEPROM_I2C_HZ);
    Wire.setTimeOut(50);
    if (extEEPROM.begin() == false) 
   {

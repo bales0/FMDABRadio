@@ -103,3 +103,14 @@ Při alokační chybě zůstává stávající vypnutí slideshow a rádio pokra
 **Na skutečném ESP32 nebylo testováno ani nahráno.** Yield není asynchronní image
 decoder ani obsluha CTS; ověřit dobu decode a ztráty na 11A/11B podle TEST_PLAN_HW.
 EPG integrace vyžaduje další souhlas a samostatné RAM/ownership testy.
+
+## Navazující schválená etapa 2026-11-02
+
+Výše uvedený stav P0 je historický. Nyní bylo doplněno headless EPG L0 jádro
+a cache jednotlivých LCD polí. Živé EPG zůstává odložené, výchozí EPG_ENABLE=0.
+Aktuální změny, testy, omezení a velikosti popisuje
+[IMPLEMENTATION_REPORT_EPG_L0_LCD.md](IMPLEMENTATION_REPORT_EPG_L0_LCD.md).
+
+Další schválený krok: EPG L1 signalling discovery a 260 B jednobitový textový
+pás. Aktuální stav, spouštění, diagnostika a ověření jsou v
+[IMPLEMENTATION_REPORT_EPG_L1_TEXT.md](IMPLEMENTATION_REPORT_EPG_L1_TEXT.md).

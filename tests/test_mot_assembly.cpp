@@ -6,6 +6,14 @@
 int main() {
   using namespace mot_assembly;
 
+  assert(receptionActive(true, 0U, 0U));
+  assert(receptionActive(true, 100U, 30099U));
+  assert(!receptionActive(true, 100U, 30100U));
+  assert(!receptionActive(true, 100U, 180100U));
+  assert(!receptionActive(false, 100U, 101U));
+  assert(receptionActive(true, 0xFFFFFF00U, 0xFFFFFF00U + 29999U));
+  assert(!receptionActive(true, 0xFFFFFF00U, 0xFFFFFF00U + 30000U));
+
   assert(segmentInRange(0U, 256U));
   assert(segmentInRange(255U, 256U));
   assert(!segmentInRange(256U, 256U));
@@ -80,5 +88,11 @@ int main() {
   assert(!lastBoundaryValid(4U, false, 4U, 3U));
   assert(!lastBoundaryValid(2U, true, 4U, 3U));
   assert(lastBoundaryValid(255U, true, 256U, 255U));
+  // A second LAST cannot shorten or extend the known final segment count.
+  assert(!lastBoundaryValid(254U, true, 256U, 255U));
+  assert(!lastBoundaryValid(256U, true, 256U, 255U));
+  // Safe packed insertion arithmetic when a missing interior segment arrives.
+  assert(canAppend(19U * 32U, 32U, arena));
+  assert(!duplicateMatches(packed, 4U, 0U, 4U, packed, 3U));
   return 0;
 }

@@ -10,6 +10,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "si4684.h"
+#include "BusConfig.h"
+#include "UiTextCache.h"
 #include "FmRegion.h"                // Si468x core + ESP32 board/application adapter
 #include "fm_af_policy.h"
 #include "Controls.h"
@@ -595,9 +597,9 @@ void applyFmRegionSelection() {
 
 constexpr uint32_t LCD_POWER_SETTLE_MS = 180U;
 constexpr uint32_t LCD_POST_SPI_SETTLE_MS = 20U;
-// Stabilization clock for shared SPI hardware. Test 16 MHz later; do not use
-// 32 MHz until signal integrity and LCD stability are confirmed on the board.
-constexpr uint32_t TFT_SPI_HZ = 8000000UL;
+// Common clock also bounds Adafruit initR via the build-local library default.
+// At APB=80MHz, the highest available clock below 1/66ns is 80MHz/6.
+constexpr uint32_t TFT_SPI_HZ = board_bus::TFT_SPI_HZ;
 
 void prepareTftSpi() {
   digitalWrite(slaveSelectPin, HIGH);
@@ -765,6 +767,7 @@ void setup() {
 }
 void loop() {
   serialMonitor.service();
+  Dab.setEpgDiscoveryEnabled(dabMode == 1 && !scanActive() && !uiBandStarting);
   Dab.task();
 
   const uint32_t now = millis();

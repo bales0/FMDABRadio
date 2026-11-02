@@ -28,6 +28,8 @@
 #include "dab_scheduler_policy.h"
 #include "dab_service_switch_policy.h"
 #include "fm_features.h"
+#include "epg_discovery.h"
+#include "EpgConfig.h"
 
 constexpr uint8_t DAB_MAX_SERVICES = 32;
 constexpr uint16_t DAB_MAX_SERVICEDATA_LEN = 129;
@@ -96,6 +98,7 @@ class DAB {
   bool requestDabTune(uint8_t frequencyIndex);
   bool requestDabService(uint8_t frequencyIndex, uint32_t serviceId, uint32_t componentId);
   bool requestDabServiceListRefresh();
+  void setEpgDiscoveryEnabled(bool enabled);
   void requestVolume(uint8_t volume);
   void task();
 
@@ -177,6 +180,7 @@ class DAB {
   bool slideshowEnabled() const;
   bool slideshowAvailable() const;
   bool slideshowCollecting() const;
+  bool slideshowReceiving(uint32_t now) const;
   uint8_t slideshowProgress() const;
   bool takeSlideshowUpdate();
   void acknowledgeSlideshow();
@@ -186,6 +190,9 @@ class DAB {
   bool urgentDataPending() const;
 
  private:
+#ifdef FMDAB_HOST_TEST
+  friend struct DabHostAccess;
+#endif
   enum class State : uint8_t {
     Off,
     PowerSettle,
@@ -233,6 +240,7 @@ class DAB {
     DabAudioCommand,
     DabServiceInfoCommand,
     DabSubchannelCommand,
+    EpgComponentCommand,
     DsrvCommand,
     Failed
   };
@@ -268,6 +276,8 @@ class DAB {
   void processDsrvReply();
   void processDabEventReply();
   void processServiceListReply();
+  void processEpgComponentReply(bool ok);
+  void reportEpgDiscovery();
   void processFmStatusReply(bool acknowledgeStc);
   void processDabStatusReply(bool acknowledgeStc);
   void resetDlsAssembler();
@@ -301,6 +311,9 @@ class DAB {
   // largest AN649 DAB service list; async commands retain this pointer until
   // CTS, so stack reply buffers are forbidden.
   uint8_t _workspace[2704];
+  epg_discovery::Discovery _epgDiscovery;
+  uint32_t _epgQueryGeneration=0;
+  bool _epgDiscoveryEnabled=false;
   Stream* _diagnostics;
   void (*_callback)(void);
 
@@ -439,6 +452,7 @@ class DAB {
   uint32_t _slideshowLastActivityMs;
   uint32_t _slideshowServiceId;
   uint32_t _slideshowComponentId;
+  uint32_t _slideshowGeneration;
   uint32_t _slideshowImageHash;
   bool _slideshowEnabled;
   bool _slideshowCollecting;

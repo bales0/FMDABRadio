@@ -6,6 +6,7 @@
  */
 #include "si4684.h"
 #include "mot_assembly_policy.h"
+#include "BusConfig.h"
 
 #include <SPI.h>
 #include <esp_heap_caps.h>
@@ -29,13 +30,12 @@ struct PropertySetting {
   uint16_t value;
 };
 
-constexpr uint32_t RADIO_SPI_HZ = 2000000UL;
+constexpr uint32_t RADIO_SPI_HZ = board_bus::RADIO_SPI_HZ;
 constexpr uint32_t DAB_IMAGE_FLASH_ADDRESS = 0x086000UL;
 constexpr uint32_t FM_IMAGE_FLASH_ADDRESS = 0x106000UL;
 constexpr uint32_t RADIO_COMMAND_TIMEOUT_US = 1000000UL;
 constexpr uint32_t RADIO_TUNE_TIMEOUT_MS = 5000UL;
 constexpr uint16_t PATCH_CHUNK_SIZE = 480;
-constexpr uint32_t SLS_COLLECTION_TIMEOUT_MS = 30000UL;
 constexpr uint16_t DAB_XPAD_DLS = 1U << 0;
 // The supplied dabreceiver enables DLS, MOT and the associated XPAD
 // applications with this value. Keep DLS-only mode minimal when SLS is off.
@@ -259,6 +259,7 @@ DAB::DAB()
       _slideshowLastActivityMs(0),
       _slideshowServiceId(0),
       _slideshowComponentId(0),
+      _slideshowGeneration(0),
       _slideshowImageHash(0),
       _slideshowEnabled(false),
       _slideshowCollecting(false),
@@ -388,6 +389,9 @@ bool DAB::allocateSlideshowArena() {
 
 void DAB::releaseSlideshowArena() {
   resetSlideshowAssembler(true);
+  _slideshowCompletedTransportValid = false;
+  _slideshowLastImageLength = 0U;
+  _slideshowImageHash = 0U;
   diagnostic("[SLS] disabled; fixed RAM arena retained, free=%u largest=%u",
              ESP.getFreeHeap(),
              heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -425,6 +429,11 @@ bool DAB::slideshowAvailable() const {
 
 bool DAB::slideshowCollecting() const {
   return _slideshowCollecting;
+}
+
+bool DAB::slideshowReceiving(uint32_t now) const {
+  return _slideshowEnabled && mot_assembly::receptionActive(
+      _slideshowCollecting, _slideshowLastActivityMs, now);
 }
 
 uint8_t DAB::slideshowProgress() const {
@@ -476,12 +485,53 @@ bool DAB::urgentDataPending() const {
          (_interruptPin != 0xFF && digitalRead(_interruptPin) == LOW);
 }
 
+void DAB::setEpgDiscoveryEnabled(bool enabled) {
+  enabled = enabled && EPG_DISCOVERY_ENABLE;
+  if (_epgDiscoveryEnabled == enabled) return;
+  _epgDiscoveryEnabled = enabled;
+  _epgDiscovery.reset();
+  if (enabled) diagnostic("[EPG/L1] discovery enabled; programmes/UI inactive");
+}
+
+void DAB::reportEpgDiscovery() {
+  diagnostic("[EPG/L1] %s components=%u answered=%u SPI=%u failed=%u; no acquisition",
+             epg_discovery::name(_epgDiscovery.status()), _epgDiscovery.count(),
+             _epgDiscovery.answered(), _epgDiscovery.confirmed(), _epgDiscovery.failed());
+}
+
+void DAB::processEpgComponentReply(bool ok) {
+  if (!_epgDiscoveryEnabled || _epgQueryGeneration != _epgDiscovery.generation()) return;
+  si468x::DabComponentInfo info;
+  uint16_t length = 28;
+  if (ok) {
+    length += _workspace[27];
+    if (length > 28)
+      ok = _radio.readCurrentReply(_workspace, length) == si468x::Result::Ok;
+    if (ok) ok = si468x::Si468x::parseDabComponentInfo(_workspace, length, info) == si468x::Result::Ok;
+  }
+  const uint16_t index = _epgDiscovery.answered();
+  if (!_epgDiscovery.commit(_epgQueryGeneration, ok ? info.userApplicationRaw : nullptr,
+                           ok ? info.userApplicationBytes : 0,
+                           ok ? info.numberOfUserApplications : 0, ok, millis())) return;
+  const auto& endpoint = _epgDiscovery.entry(index);
+  if (endpoint.identity == epg_discovery::Identity::Spi ||
+      endpoint.identity == epg_discovery::Identity::Failed)
+    diagnostic("[EPG/L1] UA SID=%08lX CID=%04X wire=%08lX result=%s transport=%s CA=%u",
+               static_cast<unsigned long>(endpoint.sid), endpoint.cid(),
+               static_cast<unsigned long>(endpoint.wire),
+               endpoint.identity == epg_discovery::Identity::Spi ? "SPI" : "failed",
+               endpoint.packetMot() ? "packet-MOT" : endpoint.pad() ? "audio-PAD" : "other",
+               endpoint.ca() ? 1U : 0U);
+  if (_epgDiscovery.finished()) reportEpgDiscovery();
+}
+
 bool DAB::beginAsync(uint8_t requestedBand) {
   if (_commandPending || (requestedBand > 1)) {
     return false;
   }
 
   _band = requestedBand;
+  _epgDiscovery.reset();
   _generation = dab_scheduler::nextGeneration(_generation);
   _operation = RadioOperation::BandBoot;
   _operationResultPending = false;
@@ -542,6 +592,9 @@ bool DAB::beginAsync(uint8_t requestedBand) {
   fmStereoBlend = 0;
   resetDlsAssembler();
   resetSlideshowAssembler(true);
+  _slideshowCompletedTransportValid = false;
+  _slideshowLastImageLength = 0U;
+  _slideshowImageHash = 0U;
   resetPeriodicDeadlines(millis());
 
   // Preserve the original FMDABRadio hardware power/reset sequence exactly.
@@ -630,6 +683,7 @@ bool DAB::requestDabTune(uint8_t frequencyIndex) {
     return false;
   }
   _operation = RadioOperation::DabTune;
+  _epgDiscovery.reset();
   _dabTuneTarget = frequencyIndex;
   _stateAfterTune = State::Ready;
   _stcPending = false;
@@ -680,6 +734,7 @@ bool DAB::requestDabService(uint8_t frequencyIndex, uint32_t serviceId,
     return false;
   }
   _operation = RadioOperation::DabService;
+  _epgDiscovery.reset();
   _dabTuneTarget = frequencyIndex;
   _serviceId = serviceId;
   // Older EEPROM records may contain the two service-list information bytes
@@ -783,14 +838,8 @@ void DAB::task() {
     scheduleReadyWork(now);
   }
 
-  if (_slideshowCollecting && _slideshowLastActivityMs != 0 &&
-      static_cast<uint32_t>(millis() - _slideshowLastActivityMs) >
-          SLS_COLLECTION_TIMEOUT_MS) {
-    diagnostic("[SLS][WARN] collection timeout: object=%06lX bytes=%lu",
-               static_cast<unsigned long>(_slideshowTransportId),
-               static_cast<unsigned long>(_slideshowReceivedBytes));
-    resetSlideshowAssembler(false);
-  }
+  // A carousel may take arbitrarily long to repeat a missing segment. Retain
+  // valid partial bytes until an identity/context/error event, never idle time.
 
   const uint32_t now = millis();
   const bool ctsCountersChanged =
@@ -881,6 +930,7 @@ const char* DAB::stateName() const {
     case State::DabSignalCommand: return "dab-signal";
     case State::DabEventCommand: return "dab-event";
     case State::DabServiceListCommand: return "dab-service-list";
+    case State::EpgComponentCommand: return "epg-component";
     case State::DabEnsembleCommand: return "dab-ensemble";
     case State::DabTimeCommand: return "dab-time";
     case State::DabAudioCommand: return "dab-audio";
@@ -1231,6 +1281,7 @@ void DAB::commandCompleted() {
     return;
   }
   const bool backgroundCommand =
+      _state == State::EpgComponentCommand ||
       _state == State::FmRsqCommand || _state == State::FmAcfCommand ||
       _state == State::FmRdsCommand || _state == State::DabSignalCommand ||
       _state == State::DabEventCommand ||
@@ -1240,6 +1291,7 @@ void DAB::commandCompleted() {
       _state == State::DabServiceInfoCommand ||
       _state == State::DabSubchannelCommand ||
       _state == State::DsrvCommand;
+  const bool epgCommand = _state == State::EpgComponentCommand;
   const bool dabMetadataCommand =
       _state == State::DabServiceListCommand ||
       _state == State::DabEnsembleCommand ||
@@ -1254,17 +1306,20 @@ void DAB::commandCompleted() {
     ++_diagDabHostStarvationCount;
     if (_radio.lastServiceGapUs() > _diagDabHostStarvationMaxGapUs)
       _diagDabHostStarvationMaxGapUs = _radio.lastServiceGapUs();
-    _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
-        ctsClass, _consecutiveCtsTimeouts);
+    if (!epgCommand)
+      _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
+          ctsClass, _consecutiveCtsTimeouts);
   } else if (ctsClass == dab_scheduler::CtsTimeoutClass::Genuine) {
     ++_diagDabGenuineCtsTimeoutCount;
-    _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
-        ctsClass, _consecutiveCtsTimeouts);
+    if (!epgCommand)
+      _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
+          ctsClass, _consecutiveCtsTimeouts);
   } else {
-    _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
-        ctsClass, _consecutiveCtsTimeouts);
+    if (!epgCommand)
+      _consecutiveCtsTimeouts = dab_scheduler::nextConsecutiveCtsTimeouts(
+          ctsClass, _consecutiveCtsTimeouts);
   }
-  if (dab_scheduler::ctsRecoveryRequired(_consecutiveCtsTimeouts) &&
+  if (!epgCommand && dab_scheduler::ctsRecoveryRequired(_consecutiveCtsTimeouts) &&
       (_lastRecoveryMs == 0U ||
        static_cast<uint32_t>(millis() - _lastRecoveryMs) >= 30000UL)) {
     _lastRecoveryMs = millis();
@@ -1283,6 +1338,14 @@ void DAB::commandCompleted() {
     return;
   }
   if (result != si468x::Result::Ok) {
+    if (_state == State::EpgComponentCommand) {
+      ++_commandErrors;
+      diagnostic("[EPG/L1] query failed: %s device=0x%02X; continuing radio",
+                 resultName(result), _radio.lastDeviceError());
+      processEpgComponentReply(false);
+      _state = State::Ready;
+      return;
+    }
     const uint8_t deviceReason = _radio.lastDeviceError();
     if (_state == State::DabTuneCommand &&
         result == si468x::Result::DeviceError && deviceReason == 0x18U) {
@@ -1420,6 +1483,10 @@ void DAB::commandCompleted() {
     }
     if (backgroundCommand) {
       ++_commandErrors;
+      if (_state == State::DabServiceListCommand && _epgDiscoveryEnabled) {
+        _epgDiscovery.invalid(millis());
+        reportEpgDiscovery();
+      }
       if (_state == State::FmRdsCommand) {
         _rdsPending = false;
         if (_fmRdsConsecutiveErrors < 5U) ++_fmRdsConsecutiveErrors;
@@ -1728,6 +1795,10 @@ void DAB::commandCompleted() {
 
     case State::DabServiceListCommand:
       processServiceListReply();
+      _state = State::Ready;
+      break;
+    case State::EpgComponentCommand:
+      processEpgComponentReply(true);
       _state = State::Ready;
       break;
 
@@ -2144,8 +2215,15 @@ void DAB::scheduleReadyWork(uint32_t now) {
   const bool lowPriorityReady =
       static_cast<uint32_t>(now - _lastLowPriorityCommandMs) >=
       dab_scheduler::DAB_LOW_PRIORITY_GAP_MS;
+  const bool epgEligible = _epgDiscoveryEnabled && valid && _activeServiceValid &&
+      _operation == RadioOperation::None && !_serviceTransitionPending;
+  if (epgEligible) {
+    if (_epgDiscovery.needsList(now)) _dabServiceListRefreshPending = true;
+    _epgDiscovery.refresh(now);
+  }
+  const bool epgDue = epgEligible && !urgentDataPending() && _epgDiscovery.due(now);
   const bool lowPriorityPending = lowPriorityReady &&
-      (_deviceEventPending ||
+      (epgDue || _deviceEventPending ||
        (valid && (_dabServiceListRefreshPending ||
                   _dabEnsembleRefreshPending || _dabTimeRefreshPending)) ||
        (valid && _activeServiceValid &&
@@ -2217,6 +2295,18 @@ void DAB::scheduleReadyWork(uint32_t now) {
     _dabSubchannelRefreshPending = false;
     startRaw(si468x::Command::DAB_GET_SUBCHAN_INFO, args, sizeof(args),
              State::DabSubchannelCommand, 100000UL, 12);
+  } else if (epgDue) {
+    const epg_discovery::Endpoint* endpoint = _epgDiscovery.issue(now);
+    if (endpoint) {
+      _epgQueryGeneration = _epgDiscovery.generation();
+      uint8_t args[11] = {0};
+      si468x::writeLe32(args + 3, endpoint->sid);
+      // Retain wire metadata separately; target protocol uses 16-bit COMP_ID.
+      si468x::writeLe32(args + 7, endpoint->cid());
+      if (!startRaw(si468x::Command::DAB_GET_COMPONENT_INFO, args, sizeof(args),
+                    State::EpgComponentCommand, 100000UL, 28))
+        processEpgComponentReply(false);
+    }
   }
 }
 
@@ -2337,6 +2427,16 @@ void DAB::processDsrvReply() {
   }
 
   const uint8_t* payload = _workspace + 24;
+  const bool ownedEpgSource =
+      (header.isPad() && _activeServiceValid && header.serviceId == _activeServiceId &&
+       header.componentId == _activeComponentId) ||
+      (header.isStandardData() && _activeDataServiceValid &&
+       header.serviceId == _activeDataServiceId && header.componentId == _activeDataComponentId);
+  if (_epgDiscoveryEnabled && ownedEpgSource &&
+      _epgDiscovery.observe(header.serviceId, header.componentId, header.dataSource, header.dscType))
+    diagnostic("[EPG/L1] passive MOT candidate SID=%08lX CID=%04lX source=%s; content unverified",
+               static_cast<unsigned long>(header.serviceId),
+               static_cast<unsigned long>(header.componentId), header.isPad() ? "PAD" : "packet");
   // Recognized DLS and MOT packets have their own detailed logs below. A
   // sampled raw header still makes an unknown/misaligned stream diagnosable
   // without letting Serial output itself cause a DSRV overflow.
@@ -2497,6 +2597,7 @@ void DAB::resetSlideshowAssembler(bool clearImage) {
   _slideshowLastActivityMs = 0;
   _slideshowServiceId = 0;
   _slideshowComponentId = 0;
+  _slideshowGeneration = 0;
   _slideshowCollecting = false;
   if (clearImage) {
     _slideshowImageLength = 0;
@@ -2555,6 +2656,32 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
   ++_motPackets;
   if (!_slideshowEnabled || length < 11U) return;
 
+  // Preserve the collector endpoint as well as the radio's active endpoint.
+  // CID=0 in a DSRV header means the current endpoint; store its canonical ID.
+  if (_band != 0U || _serviceTransitionPending) return;
+  const bool audioContext = _activeServiceValid &&
+      header.serviceId == _activeServiceId &&
+      (header.componentId == 0U || header.componentId == _activeComponentId);
+  const bool dataContext = _activeDataServiceValid &&
+      header.serviceId == _activeDataServiceId &&
+      (header.componentId == 0U || header.componentId == _activeDataComponentId);
+  if (!audioContext && !dataContext) return;
+  const uint32_t contextComponent = audioContext ? _activeComponentId
+                                                : _activeDataComponentId;
+  if (_slideshowCollecting && _slideshowGeneration != _generation)
+    resetSlideshowAssembler(true);
+  if (_slideshowCollecting &&
+      (_slideshowServiceId != header.serviceId ||
+       _slideshowComponentId != contextComponent)) {
+    const bool collectorStillActive =
+        (_activeServiceValid && _slideshowServiceId == _activeServiceId &&
+         _slideshowComponentId == _activeComponentId) ||
+        (_activeDataServiceValid && _slideshowServiceId == _activeDataServiceId &&
+         _slideshowComponentId == _activeDataComponentId);
+    if (collectorStillActive) return; // competing endpoint, not a new context
+    resetSlideshowAssembler(true);
+  }
+
   const uint16_t segmentField =
       (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
   const bool last = (segmentField & 0x8000U) != 0U;
@@ -2582,7 +2709,8 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
     uint16_t headerSize = 0;
     const bool validHeader = segment == 0U &&
         mot_assembly::decodeHeaderCore(data, dataLength, bodySize, headerSize) &&
-        bodySize <= DAB_SLS_ARENA_BYTES;
+        bodySize <= DAB_SLS_ARENA_BYTES &&
+        (!last || headerSize <= dataLength);
     diagnostic("[SLS] header object=%06lX segment=%u%s bytes=%u body=%lu header=%u",
                static_cast<unsigned long>(objectId), segment,
                last ? " LAST" : "", dataLength,
@@ -2592,19 +2720,30 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
             _slideshowPublishedPending, _slideshowCompletedTransportValid,
             _slideshowCompletedTransportId, objectId)) return;
 
-    if (!_slideshowCollecting || _slideshowTransportId != objectId ||
-        (_slideshowExpectedLength != 0U &&
-         _slideshowExpectedLength != bodySize)) {
+    if (_slideshowCollecting && _slideshowTransportId == objectId &&
+        ((_slideshowExpectedLength != 0U && _slideshowExpectedLength != bodySize) ||
+         _slideshowReceivedBytes > bodySize)) {
+      resetSlideshowAssembler(true);
+      return;
+    }
+    if (!_slideshowCollecting || _slideshowTransportId != objectId) {
       // Header metadata alone must not evict the cached image. The arena is
       // reused only when the first valid body segment is accepted below.
       resetSlideshowAssembler(false);
       _slideshowCollecting = true;
       _slideshowTransportId = objectId;
       _slideshowServiceId = header.serviceId;
-      _slideshowComponentId = header.componentId;
+      _slideshowComponentId = contextComponent;
+      _slideshowGeneration = _generation;
     }
     _slideshowExpectedLength = bodySize;
     _slideshowLastActivityMs = millis();
+    // Metadata may arrive after all body segments (with no LAST). Its exact
+    // BodySize can now confirm the complete bitmap without another carousel.
+    const uint16_t completeCount = _slideshowTotalSegments != 0U
+        ? _slideshowTotalSegments : _slideshowHighestSegment + 1U;
+    if (_slideshowReceivedBytes == bodySize &&
+        allSlideshowSegmentsReceived(completeCount)) finishSlideshowObject();
     return;
   }
 
@@ -2633,7 +2772,8 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
     _slideshowCollecting = true;
     _slideshowTransportId = objectId;
     _slideshowServiceId = header.serviceId;
-    _slideshowComponentId = header.componentId;
+    _slideshowComponentId = contextComponent;
+    _slideshowGeneration = _generation;
   } else if (_slideshowTransportId != objectId) {
     if (!mot_assembly::objectPacketBelongs(
             true, _slideshowTransportId, objectId, segment)) return;
@@ -2644,7 +2784,8 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
     _slideshowCollecting = true;
     _slideshowTransportId = objectId;
     _slideshowServiceId = header.serviceId;
-    _slideshowComponentId = header.componentId;
+    _slideshowComponentId = contextComponent;
+    _slideshowGeneration = _generation;
   }
 
   const uint8_t mask = static_cast<uint8_t>(1U << (segment & 7U));
@@ -2722,8 +2863,10 @@ void DAB::processMotPacket(const si468x::DsrvHeader& header,
                static_cast<unsigned long>(_slideshowReceivedBytes));
   }
 
-  if (_slideshowTotalSegments != 0U &&
-      allSlideshowSegmentsReceived(_slideshowTotalSegments) &&
+  const uint16_t completeCount = _slideshowTotalSegments != 0U
+      ? _slideshowTotalSegments : _slideshowHighestSegment + 1U;
+  if ((_slideshowTotalSegments != 0U || _slideshowExpectedLength != 0U) &&
+      allSlideshowSegmentsReceived(completeCount) &&
       (_slideshowExpectedLength == 0U ||
        _slideshowReceivedBytes == _slideshowExpectedLength)) {
     finishSlideshowObject();
@@ -2840,6 +2983,7 @@ void DAB::processDabEventReply() {
     _dabEnsembleRefreshPending = true;
   }
   if (event.reconfiguration || event.reconfigurationWarning) {
+    _epgDiscovery.reset();
     diagnostic("[RADIO] DAB reconfiguration event: warning=%u active=%u",
                event.reconfigurationWarning ? 1U : 0U,
                event.reconfiguration ? 1U : 0U);
@@ -2852,6 +2996,7 @@ void DAB::processServiceListReply() {
   const uint16_t listSize = si468x::readLe16(_workspace + 4);
   const uint32_t fullLength = static_cast<uint32_t>(listSize) + 6U;
   if (fullLength < 9U || fullLength > sizeof(_workspace)) {
+    if (_epgDiscoveryEnabled) { _epgDiscovery.invalid(millis()); reportEpgDiscovery(); }
     ++_commandErrors;
     diagnostic("[RADIO][WARN] invalid service-list length=%lu",
                static_cast<unsigned long>(fullLength));
@@ -2860,11 +3005,19 @@ void DAB::processServiceListReply() {
   const si468x::Result readResult = _radio.readCurrentReply(
       _workspace, static_cast<uint16_t>(fullLength));
   if (readResult != si468x::Result::Ok) {
+    if (_epgDiscoveryEnabled) { _epgDiscovery.invalid(millis()); reportEpgDiscovery(); }
     ++_commandErrors;
     diagnostic("[RADIO][WARN] service-list payload: %s", resultName(readResult));
     return;
   }
 
+  // Independent L1 inventory keeps every component, not only DABService's
+  // primary choice. Validate all records before making them queryable.
+  if (_epgDiscoveryEnabled) {
+    const uint32_t oldGeneration = _epgDiscovery.generation();
+    const bool accepted = _epgDiscovery.inventory(_workspace + 4, fullLength - 4U, millis());
+    if (!accepted || oldGeneration != _epgDiscovery.generation()) reportEpgDiscovery();
+  }
   const uint8_t previousServiceCount = numberofservices;
   DABService previousServices[DAB_MAX_SERVICES];
   if (previousServiceCount != 0U) {

@@ -15,8 +15,9 @@ Arduino framework 3.20017, PNGdec 1.1.6. Baseline zahrnuje dřívější LCD/SPI
 | Nová velká heap alokace na obrázek | 0 | 0 | 0 |
 | EPG runtime buffers | žádné | žádné | 0 B |
 
-PlatformIO RAM není totéž co volný heap a neobsahuje dynamickou cenu obou arén.
-Jejich součet zůstává 128000 B, nikoli nová rezerva přidaná k původnímu stavu.
+Oprava účtování: PlatformIO RAM již obsahuje 51200 B MOT arénu, protože je
+členem globální instance DAB. Pouze 76800 B decoder arena je samostatná heap
+alokace. MOT arénu tedy nelze ke statické RAM přičíst podruhé.
 Podpora Adam7 nevytváří další 320×240 ani 320×320 framebuffer.
 
 ## Overlay uvnitř 76800 B
@@ -69,3 +70,21 @@ Výstupy před/po obrazu samy neprokazují celou cestu IRQ→DSRV→TFT; rozsáh
 telemetrie a EPG budget patří k dalšímu schvalovanému milníku. Pokud HW test
 ukáže více CTS chyb nebo ztrát SLS při Adam7, nepokračovat do EPG live a nejprve
 vyřešit omezené plánování decode; nekompenzovat to resetováním rádia.
+
+## Navazující EPG L0 / LCD etapa 2026-11-02
+
+Default build: statická RAM 110576 B, flash 452577 B. Proti bezprostřednímu
+stavu před touto etapou +1696 B RAM a +952 B flash. LCD cache má na Xtensa
+1696 B. EPG Core má 14424 B a pět bufferů celkem 49152 B (součet 63576 B);
+Core není nikde instancován, ani při compile opt-in EPG_ENABLE=1.
+Tento rozpočet je pro budoucí integraci, nikoli aktuální heap alokace.
+MOT 51200 B je již v BSS; pouze decoder 76800 B se přičítá jako heap.
+Podrobnosti a hranice měření: IMPLEMENTATION_REPORT_EPG_L0_LCD.md.
+
+## Navazující L1 / textový buffer
+
+Aktuální default build: RAM 112192 B, flash 457461 B (+1616/+4884 B proti L0).
+Canvas objekt má 44 B BSS, obrazová data 260 B heap jednou při startu; převod
+používá 320 B dočasného řádku na stacku. Zbytek přírůstku BSS patří omezenému
+L1 inventory a jeho driver stavu. Programme Core stále není instancován.
+Aktuální podrobnosti: IMPLEMENTATION_REPORT_EPG_L1_TEXT.md.

@@ -67,3 +67,30 @@ integraci a vrátit měření/důkazy; nepřidávat automatický TFT/radio reset
 
 EPG OFF/ON, multi-SID discovery, clock/DST a L0 replay budou testy další fáze
 teprve po novém souhlasu. V tomto buildu žádné EPG příkazy ani buffers nejsou.
+
+## Doplnění po schválení EPG L0 / LCD etapy (2026-11-02)
+
+Headless L0 replay už prošel na hostu; živé EPG stále není zapojeno.
+Výchozí EPG_ENABLE=0, compile opt-in nevytváří Core ani tuner příkazy.
+
+- LCD: při změně hlasitosti/signálu/MOT/AF nesmějí blikat statické popisky.
+  Plynulý DLS posun musí zůstat ve vlastním pásu, bez pozůstatků textu.
+- Ověřit přechody FM/DAB, menu/seznam/SLS a návrat SELECT včetně plného redraw.
+- Zaznamenat skutečný free/min/largest heap a CTS během posunu textu a SLS;
+  host TFT spy dokazuje rozsah zápisů, nikoli vizuální výsledek nebo SPI latenci.
+- Live EPG čas/DST, multi-SID a RF acquisition zůstávají pro další etapu.
+
+## EPG L1 a buffer běžícího textu
+
+- Na stejném mux porovnat výchozí EPG_DISCOVERY_ENABLE=1 s build override 0:
+  audio, CTS genuine/hostStarved, DSRV overflow, SLS complete a serialDrop.
+- Při poslechu DAB čekat `[EPG/L1] pending`, jednotlivé UA výsledky a konečný
+  stav `SPI-signalled`, `not-signalled` nebo `incomplete`. Nezaměňovat SPI
+  signalizaci či pasivní MOT kandidát s dekódovanými programy.
+- Autoscan a band boot nesmějí plánovat nové component query. Ověřit změnu
+  mux/služby během discovery, pozdější reconfiguration a 60s obnovu.
+- Vadná/timeout UA nesmí sama spustit radio reset, přerušit SLS nebo audio.
+- Běžící text: žádné samostatné černé vymazání, plynulost při SLS, všechny
+  české akcenty i dolní diakritika, levý/pravý clipping, prázdný/změněný text,
+  přechody FM/DAB/menu/SLS. Změřit dopad souvislého 4160B TFT přenosu na CTS.
+- EPG TFT indikátor a Now/Next zatím nečekat; příjem PI/SI patří do L2.

@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Adapted from SI4684-FMDAB-Receiver df0c8bc9eef4c4598742fd462216675d1e885d81.
+#pragma once
+// Bounded, platform-neutral packet MOT/SPI core. ETSI EN 301 234 / TS 102 371.
+#include <stdint.h>
+#include <stddef.h>
+#include "epg_time.h"
+#include "EpgConfig.h"
+#include "DataCrc.h"
+#if EPG_ENABLE
+
+namespace epg {
+static const size_t kObjectBytes = 12288, kDirectoryBytes = 4096;
+static const size_t kMaxGroup = 4071, kMaxEntries = 80, kMaxProgrammes = 96, kTextBytes = 8192;
+// Byte-addressable DRAM only; no word-only IRAM adapter in this target.
+using Bytes = radio_data::Bytes;
+class Buffer : public Bytes {
+  uint8_t* data_;
+ public:
+  Buffer(void* data=nullptr):Bytes(static_cast<uint8_t*>(data)),data_(static_cast<uint8_t*>(data)) {}
+  void* allocation() const { return data_; }
+  void set(size_t i,uint8_t value) { data_[i]=value; }
+  void zero(size_t n) { memset(data_,0,n); }
+  void write(size_t offset,Bytes source,size_t n) { source.copyTo(data_+offset,n); }
+  void move(size_t to,size_t from,size_t n) { memmove(data_+to,data_+from,n); }
+};
+inline void increment(uint32_t& value) { if(value!=UINT32_MAX) ++value; }
+using radio_data::crc16;
+using radio_data::crc32;
+uint32_t epoch(int year, unsigned month, unsigned day, unsigned hour=0, unsigned minute=0, unsigned second=0);
+void calendar(uint32_t seconds, int& year, unsigned& month, unsigned& day);
+bool parseIso(const char* text, uint32_t& utc, int16_t& offsetMinutes);
+bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes, bool& ltoPresent);
+bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes);
+bool bearerValue(Bytes p, size_t n, uint64_t& out);
+
+// Read-only MSC envelope validation shared by admission, diagnostics and Core.
+struct GroupEnvelope {uint16_t tid=0,segment=0;uint8_t type=0,repetition=0;size_t offset=0,length=0;};
+enum class GroupCheck:uint8_t { Valid, Invalid, Crc };
+GroupCheck inspectGroup(Bytes p,size_t n,GroupEnvelope& header);
+
+struct Programme {
+  uint64_t bearer = 0;
+  uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
+  uint16_t version=0;
+  int16_t lto=0;
+  bool event=false, uncertain=false, ltoPresent=false, actualLtoPresent=false;
+  int16_t actualLto=0;
+  uint8_t rejectedTime[7]={}, rejectedTimeLength=0;
+  char name[128]={}, medium[64]={}, shortName[32]={}, description[512]={}, crid[64]={};
+};
+struct Service {
+  uint64_t bearer=0;
+  char name[48]={}, logo[32]={}, shortName[17]={};
+  bool conflict=false, png=false;
+};
+struct Entry {
+  uint32_t size=0, start=0, stop=0;
+  uint64_t bearer=0;
+  uint16_t tid=0, subtype=0, epoch=0;
+  int16_t startLto=0, stopLto=0;
+  uint8_t type=0;
+  bool seen=false, startLtoPresent=false, stopLtoPresent=false;
+  char name[32]={};
+};
+struct CachedProgramme {
+  uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
+  uint16_t title=0, description=0, version=0;
+  int16_t lto=0;
+  int16_t actualLto=0;
+  uint8_t uncertain:1, ltoPresent:1, actualLtoPresent:1;
+  uint8_t context=0;
+};
+struct Stats {
+  uint32_t frames=0, crcBad=0, invalid=0, duplicate=0, conflict=0, incomplete=0;
+  uint32_t unmapped=0, oversize=0, unsupported=0, continuityJumps=0;
+  uint8_t lastContinuity[2]={255,255}, lastRepetition[2]={}, lastMotRepetition=0;
+  uint32_t timeout=0, busy=0, directories=0, objects=0, pi=0, si=0, png=0, programmes=0, events=0;
+};
+// The same callbacks receive offline and real receiver objects; no JSON decoder.
+struct Observer {
+  void* user=nullptr;
+  void (*programme)(void*, uint16_t, const Programme&)=nullptr;
+  void (*service)(void*, uint16_t, const Service&)=nullptr;
+  void (*object)(void*, uint16_t, uint8_t, Bytes, size_t)=nullptr;
+};
+enum class Availability : uint8_t {
+  NoSpi, WaitDirectory, DirectoryEmpty, PendingIdentity, SiOnly,
+  PiLoading, PiDateStale, ReadyLive, IdentityConflict, TimeUnknown
+};
+const char* availabilityName(Availability state);
+enum class Feed : uint8_t { Accepted, Busy, Rejected };
+struct Assembly {
+  uint16_t tid=0, stride=0, last=0xffff, lengths[32]={};
+  uint32_t mask=0, touched=0;
+  bool active=false;
+  void reset();
+  // 1=complete, 0=in progress/duplicate, -1=invalid/conflict.
+  int add(uint16_t id, uint16_t segment, bool final, Bytes p, uint16_t n,
+          Buffer buffer, size_t capacity, uint32_t now, Stats& stats);
+  size_t size() const;
+};
+
+struct Reception {
+  uint32_t rx=0,duplicates=0,started=0,received=0,decoded=0,skipped=0,timeouts=0,evictions=0;
+  uint32_t first=0,progress=0,maxGap=0;
+  uint16_t index=0,tid=0;
+  uint8_t reason=0; // 0 active/complete, 1 idle timeout, 2 stalled under pressure
+  bool complete=false;
+};
+
+class Core {
+ public:
+  Stats stats;
+  Observer observer;
+  typedef void* (*Allocate)(size_t);
+  typedef void (*Release)(void*);
+  Core();
+  Core(Allocate allocate, Release release);
+  ~Core();
+  Core(const Core&) = delete;
+  Core& operator=(const Core&) = delete;
+  bool ready() const { return bodies_[0] && bodies_[1] && directory_ && logo_ && text_; }
+  static size_t bufferBytes() { return 3*kObjectBytes+kDirectoryBytes+kTextBytes; }
+  static size_t memoryBytes() { return sizeof(Core)+bufferBytes(); }
+  static size_t largestBlock() { return sizeof(Core)>kObjectBytes?sizeof(Core):kObjectBytes; }
+  void reset();
+  void focus(uint16_t tid) { if(focus_!=tid) { focus_=tid; resetBodies(); } } // bounded acquisition target; also used by host inventory test
+  void select(uint64_t bearer, uint32_t utc, int16_t displayOffset);
+  bool selectSid(uint32_t sid); // rejects multiple identities or SI conflicts
+  void setTime(uint32_t utc, int16_t displayOffset);
+  void browseDay(int delta);
+  int dayOffset() const { return browseOffset_; }
+  uint32_t localDay() const { return day_*86400U; }
+  uint64_t selected() const { return selected_; }
+  uint32_t now() const { return now_; }
+  int16_t offset() const { return offset_; }
+  const Service* station() const;
+  bool ambiguous() const;
+  uint64_t findStation(uint32_t sid,uint16_t eid,uint8_t ecc,int scids,bool& conflict) const;
+  bool hasPI() const;
+  bool hasSI() const { return station()!=nullptr; }
+  bool scheduleRange(uint32_t& start,uint32_t& end) const;
+  bool scheduleDateValid() const;
+  Availability availability(bool spiPresent) const;
+  void setLive(bool live) { liveMode_=live; }
+  void setClockTrusted(bool valid) { if(clockTrusted_!=valid) {clockTrusted_=valid;++revision;} }
+  bool clockTrusted() const { return clockTrusted_; }
+  bool transportFresh() const {return transportSeen_ && uint32_t(monotonicMs_-transportTouched_)<=900000U;}
+  bool archivePreview(uint32_t localDay); // 0 disables; never changes UTC or PI
+  bool archivePreview() const { return archiveDay_!=0; }
+  bool archived() const { return liveMode_ && !scheduleDateValid() && hasPI(); }
+  uint32_t clockLocalDay() const { return clockDay_*86400U; }
+  Feed feed(Bytes data, size_t size, uint32_t nowMs);
+  void pump(unsigned budget=48);
+  void expire(uint32_t nowMs);
+  bool busy() const { return phase_ != 0 || reception_[0].complete || reception_[1].complete; }
+  const Reception& reception(unsigned slot) const { return reception_[slot]; }
+  const Assembly& directoryAssembly() const { return dirAssembly_; } // read-only UI progress evidence
+  const Assembly& assembly(unsigned slot) const { return slot?secondAssembly_:bodyAssembly_; }
+  bool decoding(unsigned slot) const { return phase_ && decodeSlot_==slot; }
+  uint8_t slotHighWater=0;
+  size_t count() const { return viewCount_; }
+  const CachedProgramme& at(size_t i) const { return cache_[view_[i]]; }
+  const char* title(size_t i) const; // valid until the next title() call
+  const char* description(size_t i) const; // independent DRAM copy
+  int current(bool* overlapping=nullptr) const;
+  int next() const;
+  Bytes logo() const { return logoSize() ? Bytes(logo_) : Bytes(); }
+  size_t logoSize() const { return logoBearer_==selected_ && !ambiguous() ? logoBytes_ : 0; }
+  bool fresh() const { return contexts_[context_].haveData && uint32_t(monotonicMs_-contexts_[context_].touched)<=900000U; }
+  bool limited=false, identityConflict=false;
+  uint32_t revision=0;
+  const Entry* entries() const { return entries_; }
+  size_t entryCount() const { return entryCount_; }
+ private:
+  // Allocate only at construction; separate bounded blocks tolerate ESP32 heap regions.
+  void releaseBuffers();
+  Release release_;
+  Buffer body_, bodies_[2], directory_, logo_;
+  Entry entries_[kMaxEntries];
+  Service services_[16];
+  CachedProgramme cache_[kMaxProgrammes];
+  struct Context {
+    uint64_t bearer=0;
+    uint32_t day=0, used=0, touched=0;
+    uint16_t epoch=0;
+    bool valid=false, haveData=false, limited=false;
+  } contexts_[8];
+  uint8_t view_[kMaxProgrammes]={}, context_=0;
+  size_t viewCount_=0;
+  uint32_t useSequence_=0;
+  uint64_t logoBearer_=0;
+  Buffer text_;
+  mutable char titleCopy_[128]={}, descriptionCopy_[512]={};
+  size_t entryCount_=0, serviceCount_=0, count_=0, textUsed_=1, logoBytes_=0;
+  Assembly dirAssembly_, bodyAssembly_, secondAssembly_;
+  Reception reception_[2];
+  uint8_t decodeSlot_=0;
+  bool slotPressure_=false;
+  void resetBodies();
+  void startBody(unsigned slot);
+  void releaseBody(bool decoded);
+  uint64_t selected_=0;
+  uint32_t now_=0, day_=0, directoryHash_=0, assemblyTimeoutMs_=300000;
+  int16_t offset_=0;
+  int browseOffset_=0;
+  uint16_t cacheEpoch_=1, nextEpoch_=1, focus_=0;
+  uint16_t wanted();
+  bool relevantPI(const Entry& entry) const;
+  bool liveMode_=false, clockTrusted_=true, transportSeen_=false;
+  uint32_t transportTouched_=0;
+  uint32_t clockDay_=0, archiveDay_=0, acquisitionAt_=0;
+  uint16_t acquisitionTid_=0, acquisitionSkip_=0;
+  uint32_t selectionDay(uint64_t bearer,uint32_t utc,int16_t offset) const;
+  struct Level { size_t end; uint8_t tag; } stack_[24];
+  struct Token { uint16_t offset=0, length=0; } tokens_[32];
+  size_t position_=0, objectLength_=0;
+  uint8_t depth_=0, phase_=0; // 1 validation, 2 incremental semantic decode
+  uint16_t objectIndex_=0;
+  uint64_t scope_=0, defaultScope_=0;
+  uint32_t monotonicMs_=0;
+  Programme programme_[2];
+  Service service_;
+  uint8_t programmeDepth_=0;
+  bool rootService_=false;
+  bool directory(Bytes p, size_t n);
+  bool header(Bytes p, size_t n, Entry& entry, size_t& used) const;
+  void clearCache();
+  void activateContext();
+  uint16_t newEpoch();
+  void rebuildView();
+  void eraseProgramme(size_t index);
+  void eraseText(uint16_t offset);
+  void evictContext(unsigned index);
+  int oldestContext(bool populatedOnly) const;
+  void completeObject();
+  void close(uint8_t tag);
+  void attribute(uint8_t tag, Bytes p, size_t n);
+  bool text(Bytes p, size_t n, char* out, size_t capacity);
+  void cache(const Programme& p);
+  uint16_t store(const char* p);
+  void service(const Service& s);
+};
+} // namespace epg
+
+
+#endif // EPG_ENABLE

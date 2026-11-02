@@ -1,4 +1,18 @@
 constexpr uint8_t UI_LIST_ROWS = 7;
+ui_paint::ListeningCache uiListeningPaint;
+// 160*13/8 = 260 bytes, allocated once by GFXcanvas1, plus its small object.
+GFXcanvas1 uiTextCanvas(160,13);
+
+void invalidateListeningPaint() { uiListeningPaint.invalidate(); }
+
+void renderCachedUiText(UiTextField field,const String& text,int16_t x,int16_t y,
+                        uint16_t color,uint8_t size,uint16_t maxWidth) {
+  auto& cache=uiListeningPaint.fields[static_cast<uint8_t>(field)];
+  if(!cache.update(text.c_str(),color,x,y,size,maxWidth)) return;
+  const ui_paint::Rect box=ui_paint::bounds(field,dabMode==1);
+  tft.fillRect(box.x,box.y,box.w,box.h,ST77XX_BLACK);
+  drawUtf8Text(text,x,y,color,size,maxWidth);
+}
 constexpr uint8_t UI_TEXT_LINE_GLYPHS = 26;
 constexpr uint8_t UI_TEXT_WINDOW_GLYPHS = UI_TEXT_LINE_GLYPHS;
 constexpr uint16_t UI_TEXT_SCROLL_STEP_MS = 35;
@@ -23,10 +37,8 @@ String stationListHeader;
 uint8_t paintedMenuLanguage = 0;
 uint8_t paintedMenuTheme = 0;
 uint8_t menuFmRegionOnOpen = static_cast<uint8_t>(FmRegion::Europe);
-uint32_t uiObservedMotPackets = 0;
-uint32_t uiMotActivityUntilMs = 0;
-uint32_t uiMotReadyUntilMs = 0;
 bool uiObservedMotCollecting = false;
+bool uiObservedMotReceiving = false;
 uint8_t uiObservedMotProgress = 0;
 const char* const UI_DAB_CHANNELS[DAB_FREQS] = {
     "5A", "5B", "5C", "5D", "6A", "6B", "6C", "6D",
@@ -267,68 +279,68 @@ UiGlyph uiGlyph(uint32_t codepoint) {
   }
 }
 
-void drawUiAccent(int16_t x, int16_t y, uint16_t color, uint8_t size,
+void drawUiAccentOn(Adafruit_GFX& surface, int16_t x, int16_t y, uint16_t color, uint8_t size,
                   UiAccent accent) {
   const int16_t p = size;
   switch (accent) {
     case UiAccent::Acute:
-      tft.fillRect(x + 3 * p, y, p, p, color);
-      tft.fillRect(x + 2 * p, y + p, p, p, color);
+      surface.fillRect(x + 3 * p, y, p, p, color);
+      surface.fillRect(x + 2 * p, y + p, p, p, color);
       break;
     case UiAccent::Grave:
-      tft.fillRect(x + p, y, p, p, color);
-      tft.fillRect(x + 2 * p, y + p, p, p, color);
+      surface.fillRect(x + p, y, p, p, color);
+      surface.fillRect(x + 2 * p, y + p, p, p, color);
       break;
     case UiAccent::Caron:
-      tft.fillRect(x + p, y, p, p, color);
-      tft.fillRect(x + 3 * p, y, p, p, color);
-      tft.fillRect(x + 2 * p, y + p, p, p, color);
+      surface.fillRect(x + p, y, p, p, color);
+      surface.fillRect(x + 3 * p, y, p, p, color);
+      surface.fillRect(x + 2 * p, y + p, p, p, color);
       break;
     case UiAccent::Umlaut:
-      tft.fillRect(x + p, y, p, p, color);
-      tft.fillRect(x + 3 * p, y, p, p, color);
+      surface.fillRect(x + p, y, p, p, color);
+      surface.fillRect(x + 3 * p, y, p, p, color);
       break;
     case UiAccent::Circumflex:
-      tft.fillRect(x + 2 * p, y, p, p, color);
-      tft.fillRect(x + p, y + p, p, p, color);
-      tft.fillRect(x + 3 * p, y + p, p, p, color);
+      surface.fillRect(x + 2 * p, y, p, p, color);
+      surface.fillRect(x + p, y + p, p, p, color);
+      surface.fillRect(x + 3 * p, y + p, p, p, color);
       break;
     case UiAccent::Ring:
-      tft.drawRect(x + 2 * p, y, 2 * p, 2 * p, color);
+      surface.drawRect(x + 2 * p, y, 2 * p, 2 * p, color);
       break;
     case UiAccent::Tilde:
-      tft.fillRect(x + p, y + p, 2 * p, p, color);
-      tft.fillRect(x + 3 * p, y, p, p, color);
+      surface.fillRect(x + p, y + p, 2 * p, p, color);
+      surface.fillRect(x + 3 * p, y, p, p, color);
       break;
     case UiAccent::Cedilla:
-      tft.fillRect(x + 2 * p, y + 9 * p, p, p, color);
+      surface.fillRect(x + 2 * p, y + 9 * p, p, p, color);
       break;
     case UiAccent::Macron:
-      tft.fillRect(x + p, y, 3 * p, p, color);
+      surface.fillRect(x + p, y, 3 * p, p, color);
       break;
     case UiAccent::Breve:
-      tft.fillRect(x + p, y, p, p, color);
-      tft.fillRect(x + 3 * p, y, p, p, color);
-      tft.fillRect(x + 2 * p, y + p, p, p, color);
+      surface.fillRect(x + p, y, p, p, color);
+      surface.fillRect(x + 3 * p, y, p, p, color);
+      surface.fillRect(x + 2 * p, y + p, p, p, color);
       break;
     case UiAccent::DotAbove:
-      tft.fillRect(x + 2 * p, y, p, p, color);
+      surface.fillRect(x + 2 * p, y, p, p, color);
       break;
     case UiAccent::DoubleAcute:
-      tft.fillRect(x + p, y + p, p, p, color);
-      tft.fillRect(x + 2 * p, y, p, p, color);
-      tft.fillRect(x + 3 * p, y + p, p, p, color);
-      tft.fillRect(x + 4 * p, y, p, p, color);
+      surface.fillRect(x + p, y + p, p, p, color);
+      surface.fillRect(x + 2 * p, y, p, p, color);
+      surface.fillRect(x + 3 * p, y + p, p, p, color);
+      surface.fillRect(x + 4 * p, y, p, p, color);
       break;
     case UiAccent::Ogonek:
-      tft.fillRect(x + 3 * p, y + 9 * p, p, p, color);
-      tft.fillRect(x + 2 * p, y + 10 * p, p, p, color);
+      surface.fillRect(x + 3 * p, y + 9 * p, p, p, color);
+      surface.fillRect(x + 2 * p, y + 10 * p, p, p, color);
       break;
     case UiAccent::Stroke:
-      tft.fillRect(x + p, y + 5 * p, 4 * p, p, color);
+      surface.fillRect(x + p, y + 5 * p, 4 * p, p, color);
       break;
     case UiAccent::MiddleDot:
-      tft.fillRect(x + 4 * p, y + 5 * p, p, p, color);
+      surface.fillRect(x + 4 * p, y + 5 * p, p, p, color);
       break;
     default:
       break;
@@ -367,7 +379,7 @@ static_assert(sizeof(UI_SPECIAL_BITMAPS) / sizeof(UI_SPECIAL_BITMAPS[0]) ==
                   static_cast<uint8_t>(UiSpecialGlyph::HorizontalBar),
               "UiSpecialGlyph table is incomplete");
 
-void drawUiSpecialGlyph(int16_t x, int16_t y, uint16_t color, uint8_t size,
+void drawUiSpecialGlyphOn(Adafruit_GFX& surface, int16_t x, int16_t y, uint16_t color, uint8_t size,
                         UiSpecialGlyph glyph) {
   if (glyph == UiSpecialGlyph::None) return;
   const uint8_t index = static_cast<uint8_t>(glyph) - 1;
@@ -375,7 +387,7 @@ void drawUiSpecialGlyph(int16_t x, int16_t y, uint16_t color, uint8_t size,
     const uint8_t bits = pgm_read_byte(&UI_SPECIAL_BITMAPS[index][row]);
     for (uint8_t column = 0; column < 5; ++column) {
       if ((bits & (1U << (4 - column))) != 0) {
-        tft.fillRect(x + column * size, y + (row + 2) * size,
+        surface.fillRect(x + column * size, y + (row + 2) * size,
                      size, size, color);
       }
     }
@@ -416,23 +428,28 @@ uint16_t utf8TextWidth(const String& text, uint8_t size) {
   return utf8CodepointCount(text) * 6U * size;
 }
 
-void drawUtf8Text(const String& text, int16_t x, int16_t y, uint16_t color,
-                  uint8_t size, uint16_t maxWidth = 160) {
+void drawUtf8TextOn(Adafruit_GFX& surface, const String& text, int16_t x, int16_t y, uint16_t color,
+                  uint8_t size, uint16_t maxWidth) {
   uint16_t offset = 0;
   const int16_t startX = x;
-  tft.setTextSize(size);
-  tft.setTextColor(color);
+  surface.setTextSize(size);
+  surface.setTextColor(color);
   while (offset < text.length() && x + 6 * size <= startX + maxWidth) {
     const UiGlyph glyph = uiGlyph(nextUtf8Codepoint(text, offset));
     if (glyph.special == UiSpecialGlyph::None) {
-      tft.setCursor(x, y + 2 * size);
-      tft.write(static_cast<uint8_t>(glyph.base));
-      drawUiAccent(x, y, color, size, glyph.accent);
+      surface.setCursor(x, y + 2 * size);
+      surface.write(static_cast<uint8_t>(glyph.base));
+      drawUiAccentOn(surface, x, y, color, size, glyph.accent);
     } else {
-      drawUiSpecialGlyph(x, y, color, size, glyph.special);
+      drawUiSpecialGlyphOn(surface, x, y, color, size, glyph.special);
     }
     x += 6 * size;
   }
+}
+
+void drawUtf8Text(const String& text, int16_t x, int16_t y, uint16_t color,
+                  uint8_t size, uint16_t maxWidth = 160) {
+  drawUtf8TextOn(tft,text,x,y,color,size,maxWidth);
 }
 
 uint8_t currentUiStationCount() {
@@ -658,10 +675,9 @@ String uiCircularTextSlice(uint16_t start, uint16_t count) {
 
 void renderUiHeader() {
   if (uiView != UiView::Text) return;
-  tft.fillRect(0, 0, screenWidth, 14, ST77XX_BLACK);
   const char* band = dabMode == 1
       ? (Dab.dabplus ? "DAB+" : "DAB") : "FM";
-  drawUtf8Text(String(band), 2, 1, ST77XX_YELLOW, 1, 24);
+  renderCachedUiText(UiTextField::Band, String(band), 2, 1, ST77XX_YELLOW, 1, 24);
   char detail[22];
   if (dabMode == 1) {
     const uint32_t frequency = ensemble < DAB_FREQS ? Dab.freq_khz(ensemble) : 0;
@@ -674,14 +690,18 @@ void renderUiHeader() {
     snprintf(detail, sizeof(detail), "%u.%1uMHz", frequency / 100,
              (frequency % 100) / 10);
   }
-  drawUtf8Text(String(detail), dabMode == 1 ? 30 : 19, 1,
+  renderCachedUiText(UiTextField::Detail, String(detail), dabMode == 1 ? 30 : 19, 1,
                ST77XX_WHITE, 1, dabMode == 1 ? 88 : 99);
   char volumeText[8];
-  snprintf(volumeText, sizeof(volumeText), "VOL %u", vol);
+  snprintf(volumeText, sizeof(volumeText), "%u", vol);
   const uint16_t width = utf8TextWidth(String(volumeText), 1);
-  drawUtf8Text(String(volumeText), screenWidth - width - 2, 1,
+  renderCachedUiText(UiTextField::VolumeLabel, "VOL", 122, 1, ST77XX_GREEN, 1, 18);
+  renderCachedUiText(UiTextField::Volume, String(volumeText), screenWidth - width - 2, 1,
                ST77XX_GREEN, 1, width);
-  tft.drawFastHLine(0, 14, screenWidth, UI_DARK_LINE);
+  if(!uiListeningPaint.headerLine) {
+    tft.drawFastHLine(0,14,screenWidth,UI_DARK_LINE);
+    uiListeningPaint.headerLine=true;
+  }
 }
 
 String currentUiStationName() {
@@ -722,7 +742,6 @@ void resetUiStationScroll() {
 
 void renderUiStationName() {
   if (uiView != UiView::Text) return;
-  tft.fillRect(0, 15, screenWidth, 24, ST77XX_BLACK);
   String name = currentUiStationName();
   constexpr uint16_t visibleGlyphs = 13;
   const uint16_t glyphCount = utf8CodepointCount(name);
@@ -735,25 +754,58 @@ void renderUiStationName() {
   }
   const uint16_t width = utf8TextWidth(name, 2);
   const int16_t x = width < screenWidth ? (screenWidth - width) / 2 : 0;
-  drawUtf8Text(name, x, 16,
+  renderCachedUiText(UiTextField::Station, name, x, 16,
                stationPreviewActive ? UI_GRAY : uiStationColor(),
                2, screenWidth);
-  tft.drawFastHLine(0, 40, screenWidth, UI_DARK_LINE);
+  if(!uiListeningPaint.stationLine) {
+    tft.drawFastHLine(0,40,screenWidth,UI_DARK_LINE);
+    uiListeningPaint.stationLine=true;
+  }
+}
+
+void pushUiTextStrip(uint16_t color) {
+  const uint8_t* bits=uiTextCanvas.getBuffer();
+  uint16_t row[160]; // 320 B transient stack, no RGB framebuffer or heap churn.
+  prepareTftSpi();
+  tft.startWrite();
+  tft.setAddrWindow(0,53,160,13);
+  for(uint8_t y=0;y<13;++y) {
+    for(uint16_t x=0;x<160;++x)
+      row[x]=(bits[y*20U+x/8U] & (0x80U>>(x&7U))) ? color : ST77XX_BLACK;
+    tft.writePixels(row,160);
+  }
+  tft.endWrite();
+}
+
+void drawUiTextStrip(const String& text,int16_t x,uint16_t color,uint16_t maxWidth) {
+  if(!uiTextCanvas.getBuffer()) {
+    // Allocation failure preserves text and radio operation with the old path.
+    tft.fillRect(0,53,screenWidth,13,ST77XX_BLACK);
+    drawUtf8Text(text,x,55,color,1,maxWidth);
+    return;
+  }
+  uiTextCanvas.fillScreen(0);
+  uiTextCanvas.setTextWrap(false);
+  // Global text origin stays y=55. Include the final ogonek/descender row.
+  drawUtf8TextOn(uiTextCanvas,text,x,2,1,1,maxWidth);
+  pushUiTextStrip(color);
 }
 
 void renderUiTextArea() {
   if (uiView != UiView::Text || scanActive()) return;
-  tft.fillRect(0, 52, screenWidth, 13, ST77XX_BLACK);
   if (uiBroadcastText.length() == 0) {
-    drawUtf8Text("Waiting for broadcast text", 2, 55, 0x7BEF, 1, 156);
+    if(uiListeningPaint.broadcast.update("Waiting for broadcast text",0x7BEF,2,55,1,156)) {
+      drawUiTextStrip("Waiting for broadcast text",2,0x7BEF,156);
+    }
     return;
   }
   const uint16_t glyphOffset = uiTextScrollGlyph / 6U;
   const uint8_t pixelOffset = uiTextScrollGlyph % 6U;
   const String line = uiCircularTextSlice(glyphOffset,
                                            UI_TEXT_LINE_GLYPHS + 2U);
-  drawUtf8Text(line, 2 - pixelOffset, 55, ST77XX_WHITE, 1,
-               158U + pixelOffset);
+  if(uiListeningPaint.broadcast.update(line.c_str(),ST77XX_WHITE,2-pixelOffset,55,1,158U+pixelOffset)) {
+    drawUiTextStrip(line,2-pixelOffset,ST77XX_WHITE,158U+pixelOffset);
+  }
 }
 
 uint16_t uiSignalColor(int8_t quality, bool dab) {
@@ -780,37 +832,37 @@ uint16_t uiFicColor(uint8_t quality) {
 
 void renderUiSignal() {
   if (scanActive() || uiView != UiView::Text) return;
-  tft.fillRect(0, 96, screenWidth, 15, ST77XX_BLACK);
   char value[32];
   const int8_t displayedSnr = uiDisplayedSnr();
   const int8_t displayedRssi = uiDisplayedRssi();
   if (dabMode == 1) {
-    drawUtf8Text("CNR", 2, 98, ST77XX_CYAN, 1, 24);
+    renderCachedUiText(UiTextField::SignalLabel, "CNR", 2, 98, ST77XX_CYAN, 1, 24);
     snprintf(value, sizeof(value), "%d dB", displayedSnr);
-    drawUtf8Text(String(value), 28, 98, uiSignalColor(displayedSnr, true), 1, 45);
-    drawUtf8Text("RSSI", 78, 98, ST77XX_CYAN, 1, 30);
+    renderCachedUiText(UiTextField::Snr, String(value), 28, 98, uiSignalColor(displayedSnr, true), 1, 45);
+    renderCachedUiText(UiTextField::RssiLabel, "RSSI", 78, 98, ST77XX_CYAN, 1, 30);
     snprintf(value, sizeof(value), "%d%s", uiSignalValue(displayedRssi),
              uiSignalUnitName());
-    drawUtf8Text(String(value), 110, 98,
+    renderCachedUiText(UiTextField::Rssi, String(value), 110, 98,
                  uiRssiColor(displayedRssi, true), 1, 48);
 
   } else {
-    drawUtf8Text("SNR", 2, 98, ST77XX_CYAN, 1, 24);
+    renderCachedUiText(UiTextField::SignalLabel, "SNR", 2, 98, ST77XX_CYAN, 1, 24);
     snprintf(value, sizeof(value), "%d dB", displayedSnr);
-    drawUtf8Text(String(value), 28, 98, uiSignalColor(displayedSnr, false), 1, 45);
-    drawUtf8Text("RSSI", 78, 98, ST77XX_CYAN, 1, 30);
+    renderCachedUiText(UiTextField::Snr, String(value), 28, 98, uiSignalColor(displayedSnr, false), 1, 45);
+    renderCachedUiText(UiTextField::RssiLabel, "RSSI", 78, 98, ST77XX_CYAN, 1, 30);
     snprintf(value, sizeof(value), "%d%s", uiSignalValue(displayedRssi),
              uiSignalUnitName());
-    drawUtf8Text(String(value), 110, 98,
+    renderCachedUiText(UiTextField::Rssi, String(value), 110, 98,
                  uiRssiColor(displayedRssi, false), 1, 48);
   }
 }
 
 void renderUiStatusStatic() {
   if (scanActive() || uiView != UiView::Text) return;
-  tft.fillRect(0, 81, screenWidth, 15, ST77XX_BLACK);
-  tft.fillRect(0, 111, screenWidth, 17, ST77XX_BLACK);
-  tft.drawFastHLine(0, 80, screenWidth, UI_DARK_LINE);
+  if(!uiListeningPaint.statusLine) {
+    tft.drawFastHLine(0,80,screenWidth,UI_DARK_LINE);
+    uiListeningPaint.statusLine=true;
+  }
   char value[32];
   if (dabMode == 1) {
     static const char* const shortAudioMode[] = {"DUAL", "MONO", "ST", "J-ST"};
@@ -822,57 +874,50 @@ void renderUiStatusStatic() {
                Dab.samplerate / 1000U,
                shortAudioMode[static_cast<uint8_t>(Dab.mode) & 0x03U]);
     }
-    drawUtf8Text(String(value), 2, 83, ST77XX_WHITE, 1, 156);
-    drawUtf8Text("RX", 2, 113, Dab.valid ? ST77XX_GREEN : ST77XX_RED, 1, 12);
-    drawUtf8Text("FIC", 20, 113, ST77XX_CYAN, 1, 18);
+    renderCachedUiText(UiTextField::Audio, String(value), 2, 83, ST77XX_WHITE, 1, 156);
+    renderCachedUiText(UiTextField::Rx, "RX", 2, 113, Dab.valid ? ST77XX_GREEN : ST77XX_RED, 1, 12);
+    renderCachedUiText(UiTextField::Fic, "FIC", 20, 113, ST77XX_CYAN, 1, 18);
     const uint8_t displayedQuality = uiDisplayedQuality();
     snprintf(value, sizeof(value), "%u%%", displayedQuality);
-    drawUtf8Text(String(value), 44, 113, uiFicColor(displayedQuality), 1, 26);
+    renderCachedUiText(UiTextField::Quality, String(value), 44, 113, uiFicColor(displayedQuality), 1, 26);
     const uint32_t now = millis();
-    const bool motLoading = Dab.slideshowCollecting();
-    const bool motReady = Dab.slideshowAvailable() ||
-        (uiMotReadyUntilMs != 0U &&
-         static_cast<int32_t>(uiMotReadyUntilMs - now) > 0);
-    const bool motPresent = motLoading || motReady ||
-        (uiMotActivityUntilMs != 0U &&
-         static_cast<int32_t>(uiMotActivityUntilMs - now) > 0);
-    drawUtf8Text("MOT", 72, 113,
+    const bool motLoading = Dab.slideshowReceiving(now);
+    const bool motReady = Dab.slideshowAvailable();
+    renderCachedUiText(UiTextField::MotLabel, "MOT", 72, 113,
                  motReady ? ST77XX_GREEN
-                          : (motLoading ? ST77XX_YELLOW
-                                        : (motPresent ? ST77XX_CYAN : UI_GRAY)),
+                          : (motLoading ? ST77XX_YELLOW : UI_GRAY),
                  1, 18);
-    if (motLoading && Dab.slideshowProgress() != 0U)
+    if (motReady) snprintf(value, sizeof(value), "OK");
+    else if (motLoading && Dab.slideshowProgress() != 0U)
       snprintf(value, sizeof(value), "%u%%", Dab.slideshowProgress());
     else if (motLoading) snprintf(value, sizeof(value), "RX");
-    else snprintf(value, sizeof(value), "%s", motReady ? "OK" :
-                  (motPresent ? "RX" : "--"));
-    drawUtf8Text(String(value), 94, 113,
+    else snprintf(value, sizeof(value), "--");
+    renderCachedUiText(UiTextField::MotValue, String(value), 94, 113,
                  motReady ? ST77XX_GREEN
-                          : (motLoading ? ST77XX_YELLOW
-                                        : (motPresent ? ST77XX_CYAN : UI_GRAY)),
+                          : (motLoading ? ST77XX_YELLOW : UI_GRAY),
                  1, 30);
     snprintf(value, sizeof(value), "%u/%u", currentDABchannel,
              totalDABchannels);
-    drawUtf8Text(String(value), 128, 113, ST77XX_WHITE, 1, 30);
+    renderCachedUiText(UiTextField::StationIndex, String(value), 128, 113, ST77XX_WHITE, 1, 30);
   } else {
-    drawUtf8Text(Dab.fmPilot ? "STEREO" : "MONO", 2, 83,
+    renderCachedUiText(UiTextField::Audio, Dab.fmPilot ? "STEREO" : "MONO", 2, 83,
                  Dab.fmPilot ? ST77XX_GREEN : ST77XX_YELLOW, 1, 44);
     const char* rdsLabel = fmRegionProfile(uiSettings.fmRegion).rbds ? "RBDS" : "RDS";
-    drawUtf8Text(rdsLabel, 52, 83,
+    renderCachedUiText(UiTextField::Rds, rdsLabel, 52, 83,
                  Dab.rdsSync ? ST77XX_GREEN : ST77XX_RED, 1, 24);
-    drawUtf8Text("TP", 86, 83, Dab.tp ? ST77XX_GREEN : UI_GRAY, 1, 18);
-    drawUtf8Text("TA", 113, 83, Dab.ta ? UI_ORANGE : UI_GRAY, 1, 18);
+    renderCachedUiText(UiTextField::Tp, "TP", 86, 83, Dab.tp ? ST77XX_GREEN : UI_GRAY, 1, 18);
+    renderCachedUiText(UiTextField::Ta, "TA", 113, 83, Dab.ta ? UI_ORANGE : UI_GRAY, 1, 18);
     uint16_t afColor = UI_GRAY;
     if (uiSettings.fmAfEnabled) {
       afColor = fmAfActive() ? UI_ORANGE
           : (Dab.fmAfList().count != 0 ? ST77XX_GREEN : ST77XX_CYAN);
     }
-    drawUtf8Text("AF", 139, 83, afColor, 1, 18);
+    renderCachedUiText(UiTextField::Af, "AF", 139, 83, afColor, 1, 18);
     snprintf(value, sizeof(value), "PTY %u  PI %04X", Dab.pty, Dab.pi);
-    drawUtf8Text(String(value), 2, 113, UI_GRAY, 1, 92);
+    renderCachedUiText(UiTextField::Pty, String(value), 2, 113, UI_GRAY, 1, 92);
     snprintf(value, sizeof(value), "%u/%u", currentFMchannel,
              totalFMchannels);
-    drawUtf8Text(String(value), 128, 113, UI_GRAY, 1, 30);
+    renderCachedUiText(UiTextField::StationIndex, String(value), 128, 113, UI_GRAY, 1, 30);
   }
 }
 
@@ -951,7 +996,9 @@ void flushUiDirty() {
   const uint8_t dirty = uiDirtyFlags;
   uiDirtyFlags = UI_DIRTY_NONE;
   if ((dirty & UI_DIRTY_FULL) != 0) {
-    renderCurrentUiView();
+    if(uiView==UiView::Menu) renderMenu();
+    else if(uiView==UiView::StationList) renderStationList();
+    else renderCurrentUiView();
     return;
   }
   if (uiView == UiView::Text) {
@@ -1536,35 +1583,20 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
 void serviceUi(uint32_t now) {
   serviceUiSignalFilter(now);
   if (uiBandStarting) return;
-  const uint32_t motPackets = Dab.motPacketCount();
   const bool motCollecting = Dab.slideshowCollecting();
+  const bool motReceiving = Dab.slideshowReceiving(now);
   const uint8_t motProgress = Dab.slideshowProgress();
-  if (motPackets != uiObservedMotPackets) {
-    uiObservedMotPackets = motPackets;
-    uiMotActivityUntilMs = now + 3000U;
-    markUiDirty(UI_DIRTY_STATUS);
-  }
   if (motCollecting != uiObservedMotCollecting ||
+      motReceiving != uiObservedMotReceiving ||
       motProgress != uiObservedMotProgress) {
     uiObservedMotCollecting = motCollecting;
+    uiObservedMotReceiving = motReceiving;
     uiObservedMotProgress = motProgress;
-    markUiDirty(UI_DIRTY_STATUS);
-  }
-  if (Dab.slideshowAvailable()) uiMotReadyUntilMs = now + 5000U;
-  if (uiMotActivityUntilMs != 0U &&
-      static_cast<int32_t>(now - uiMotActivityUntilMs) >= 0) {
-    uiMotActivityUntilMs = 0;
-    markUiDirty(UI_DIRTY_STATUS);
-  }
-  if (uiMotReadyUntilMs != 0U && !Dab.slideshowAvailable() &&
-      static_cast<int32_t>(now - uiMotReadyUntilMs) >= 0) {
-    uiMotReadyUntilMs = 0;
     markUiDirty(UI_DIRTY_STATUS);
   }
   flushUiDirty();
   if (Dab.takeSlideshowUpdate()) {
     uiSlideshowDecodePending = true;
-    uiMotReadyUntilMs = now + 5000U;
     markUiDirty(UI_DIRTY_STATUS);
   }
 
