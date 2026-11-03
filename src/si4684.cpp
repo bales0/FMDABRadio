@@ -47,7 +47,7 @@ constexpr uint16_t DAB_XPAD_DLS = 1U << 0;
 constexpr uint16_t DAB_XPAD_RECEIVER_COMPAT = 0x0097;
 
 uint16_t dabXpadValue(bool slideshowEnabled) {
-  return slideshowEnabled ? DAB_XPAD_RECEIVER_COMPAT : DAB_XPAD_DLS;
+  return (slideshowEnabled || (EPG_ENABLE && EPG_DISCOVERY_ENABLE)) ? DAB_XPAD_RECEIVER_COMPAT : DAB_XPAD_DLS;
 }
 
 volatile bool si4684IrqEdge = false;
@@ -416,7 +416,7 @@ bool DAB::setSlideshowEnabled(bool enabled) {
   if (!enabled) {
     releaseSlideshowArena();
     _dataServicePending = false;
-    _dataServiceStopPending = _activeDataServiceValid;
+    _dataServiceStopPending = _activeDataServiceValid && !_epgDataOwner;
   }
   if (changed && _band == 0 && _state == State::Ready) {
     _slideshowPropertyPending = true;
@@ -566,11 +566,13 @@ void DAB::setEpgDiscoveryEnabled(bool enabled) {
   if (_epgDiscoveryEnabled == enabled) return;
   _epgDiscoveryEnabled = enabled;
   _epgDiscovery.reset();
-  if (enabled) diagnostic("[EPG/L1] discovery enabled; programmes/UI inactive");
+  epg_live::context(epg_live::Context{});
+  _epgClock=epg::BroadcastClockSample{};_epgUtcPending=_epgLocalPending=false;
+  if (enabled) diagnostic("[EPG/L1] discovery enabled; live runtime follows memory/ownership gates");
 }
 
 void DAB::reportEpgDiscovery() {
-  diagnostic("[EPG/L1] %s components=%u answered=%u SPI=%u failed=%u; no acquisition",
+  diagnostic("[EPG/L1] %s components=%u answered=%u SPI=%u failed=%u",
              epg_discovery::name(_epgDiscovery.status()), _epgDiscovery.count(),
              _epgDiscovery.answered(), _epgDiscovery.confirmed(), _epgDiscovery.failed());
 }
@@ -601,13 +603,52 @@ void DAB::processEpgComponentReply(bool ok) {
   if (_epgDiscovery.finished()) reportEpgDiscovery();
 }
 
+void DAB::serviceEpg(uint32_t now) {
+#if EPG_ENABLE
+  epg_live::Context c;
+  c.generation=_generation;c.sid=_activeServiceId;c.cid=_activeComponentId;
+  c.eid=uint16_t(EnsembleID);c.ecc=uint8_t(ECC);
+  c.uaTotal=_epgDiscovery.count();c.uaAnswered=_epgDiscovery.answered();c.uaConfirmed=_epgDiscovery.confirmed();
+  c.stable=_epgDiscoveryEnabled && _band==0 && valid && _activeServiceValid &&
+    _operation==RadioOperation::None && !_serviceTransitionPending &&
+    !_audioActivation.pending() && _state!=State::Off;
+  for(unsigned i=0;i<_epgDiscovery.count();++i){
+    const auto& e=_epgDiscovery.entry(i);
+    if(e.identity!=epg_discovery::Identity::Spi)continue;
+    c.present=true;
+    if(e.ca())continue;
+    if(e.pad() && e.sid==c.sid && e.cid()==uint16_t(c.cid))c.pad=true;
+    if(e.packetMot() && !e.slideshow && !_epgCleanupFailed && _activeDataServiceValid && e.sid==_activeDataServiceId &&
+       e.cid()==uint16_t(_activeDataComponentId)){
+      c.packet=true;c.packetSid=e.sid;c.packetCid=e.cid();
+    }
+  }
+  // PAD owns the parser whenever confirmed on the current audio component.
+  // Packet groups may still be drained, but cannot mix assembly contexts.
+  if(c.pad){c.packet=false;c.packetSid=c.packetCid=0;}
+  if(c.packet && !_epgDataOwner){
+    _epgDataOwner=true;
+    diagnostic("[EPG/L2] active data owner classified by confirmed SPI UA");
+  }
+  if(_epgDataOwner && !_epgCleanupFailed && _epgDiscovery.finished() && (!c.packet || c.pad))
+    _dataServiceStopPending=_activeDataServiceValid;
+  epg_live::context(c);
+  epg_live::clock(_epgClock,now);
+#else
+  (void)now;
+#endif
+}
+
 bool DAB::beginAsync(uint8_t requestedBand) {
   if (_commandPending || (requestedBand > 1)) {
     return false;
   }
 
   _band = requestedBand;
+  _epgDataOwner=_epgCleanupFailed=false;_epgStartNotBefore=0;
   _epgDiscovery.reset();
+  epg_live::context(epg_live::Context{});
+  _epgClock=epg::BroadcastClockSample{};_epgUtcPending=_epgLocalPending=false;
   _audioActivation.cancel();
   _audioRfCheck=_rfParseOk=_audioListKnown=_audioListVersionKnown=false;
   _generation = dab_scheduler::nextGeneration(_generation);
@@ -763,9 +804,12 @@ bool DAB::requestDabTune(uint8_t frequencyIndex) {
     return false;
   }
   _operation = RadioOperation::DabTune;
+  _epgStartNotBefore=0;
   cancelAudioActivation();
   _audioListKnown=false;
   _epgDiscovery.reset();
+  epg_live::context(epg_live::Context{});
+  _epgClock=epg::BroadcastClockSample{};_epgUtcPending=_epgLocalPending=false;
   _dabTuneTarget = frequencyIndex;
   _stateAfterTune = State::Ready;
   _stcPending = false;
@@ -816,10 +860,13 @@ bool DAB::requestDabService(uint8_t frequencyIndex, uint32_t serviceId,
     return false;
   }
   _operation = RadioOperation::DabService;
+  _epgStartNotBefore=0;
   cancelAudioActivation();
   _audioActivation.request(millis());
   _audioListKnown=false;
   _epgDiscovery.reset();
+  epg_live::context(epg_live::Context{});
+  _epgClock=epg::BroadcastClockSample{};_epgUtcPending=_epgLocalPending=false;
   _dabTuneTarget = frequencyIndex;
   _serviceId = serviceId;
   // Older EEPROM records may contain the two service-list information bytes
@@ -1022,6 +1069,7 @@ const char* DAB::stateName() const {
     case State::DabServiceListCommand: return "dab-service-list";
     case State::DabRfWait: return "dab-rf-wait";
     case State::EpgComponentCommand: return "epg-component";
+    case State::EpgStartCommand: return "epg-start";
     case State::DabEnsembleCommand: return "dab-ensemble";
     case State::DabTimeCommand: return "dab-time";
     case State::DabAudioCommand: return "dab-audio";
@@ -1384,7 +1432,7 @@ void DAB::commandCompleted() {
     return;
   }
   const bool backgroundCommand =
-      _state == State::EpgComponentCommand ||
+      _state == State::EpgComponentCommand || _state == State::EpgStartCommand ||
       _state == State::FmRsqCommand || _state == State::FmAcfCommand ||
       _state == State::FmRdsCommand || _state == State::DabSignalCommand ||
       _state == State::DabEventCommand ||
@@ -1394,7 +1442,8 @@ void DAB::commandCompleted() {
       _state == State::DabServiceInfoCommand ||
       _state == State::DabSubchannelCommand ||
       _state == State::DsrvCommand;
-  const bool epgCommand = _state == State::EpgComponentCommand;
+  const bool epgCommand = _state == State::EpgComponentCommand || _state == State::EpgStartCommand ||
+    (_state==State::DabStopDataServiceCommand && _epgDataOwner && !_serviceTransitionPending);
   const bool dabMetadataCommand =
       _state == State::DabServiceListCommand ||
       _state == State::DabEnsembleCommand ||
@@ -1441,6 +1490,15 @@ void DAB::commandCompleted() {
     return;
   }
   if (result != si468x::Result::Ok) {
+    if (_state == State::EpgStartCommand) {
+      ++_commandErrors;
+      diagnostic("[EPG/L2] START failed %s device=%02X; bounded cleanup",resultName(result),_radio.lastDeviceError());
+      // Even a timeout may have activated this endpoint: retain its identity
+      // and serialize bounded STOP through the existing data cleanup owner.
+      _activeDataServiceId=_epgStartSid;_activeDataComponentId=_epgStartCid;
+      _activeDataServiceValid=true;_epgDataOwner=true;_dataServiceStopPending=true;
+      _epgStartNotBefore=millis()+60000U;_state=State::Ready;return;
+    }
     if (_state == State::EpgComponentCommand) {
       ++_commandErrors;
       diagnostic("[EPG/L1] query failed: %s device=0x%02X; continuing radio",
@@ -1503,6 +1561,8 @@ void DAB::commandCompleted() {
       if (alreadyStopped) {
         diagnostic("[DAB/SWITCH] data STOP already inactive; continuing");
         _activeDataServiceValid = false;
+        _epgDataOwner=false;
+        _epgCleanupFailed=false;
         _dataServiceStopPending = false;
         _dabSwitch.stopRetries = 0U;
         const dab_switch::State next = dab_switch::afterDataStop(
@@ -1526,6 +1586,10 @@ void DAB::commandCompleted() {
                    resultName(result));
       } else {
         diagnostic("[DAB/SWITCH] data STOP retries exhausted; new stream not started");
+        if(_epgDataOwner && !_serviceTransitionPending){
+          _epgCleanupFailed=true;_dataServiceStopPending=false;
+          diagnostic("[EPG/L2] cleanup failed; endpoint quarantined, audio retained");
+        }
         finishOperation(false);
       }
       return;
@@ -1762,6 +1826,8 @@ void DAB::commandCompleted() {
                  static_cast<unsigned long>(_activeDataServiceId),
                  static_cast<unsigned long>(_activeDataComponentId));
       _activeDataServiceValid = false;
+      _epgDataOwner=false;
+      _epgCleanupFailed=false;
       _dataServiceStopPending = false;
       _dabSwitch.stopRetries = 0U;
       const dab_switch::State next = dab_switch::afterDataStop(
@@ -1814,7 +1880,14 @@ void DAB::commandCompleted() {
       finishOperation(true);
       break;
 
+    case State::EpgStartCommand:
+      _activeDataServiceId=_epgStartSid;_activeDataComponentId=_epgStartCid;
+      _activeDataServiceValid=true;_epgDataOwner=true;
+      diagnostic("[EPG/L2] packet owner SID=%08lX CID=%04lX",(unsigned long)_epgStartSid,(unsigned long)_epgStartCid);
+      _state=State::Ready;break;
+
     case State::DabDataServiceCommand:
+      _epgDataOwner=false;
       _activeDataServiceId = _dataServiceId;
       _activeDataComponentId = _dataComponentId;
       _activeDataServiceValid = true;
@@ -1938,14 +2011,25 @@ void DAB::commandCompleted() {
       si468x::DabTimeInfo value;
       if (si468x::Si468x::parseDabTime(_workspace, 11, value) ==
           si468x::Result::Ok) {
-        Year = value.year;
-        Months = value.month;
-        Days = value.day;
-        Hours = value.hour;
-        Minutes = value.minute;
-        Seconds = value.second;
-        _timeSampleGeneration =
-            dab_scheduler::nextGeneration(_timeSampleGeneration);
+#if EPG_ENABLE
+        const uint32_t valueEpoch=epg::epoch(value.year,value.month,value.day,value.hour,value.minute,value.second);
+        if(_epgUtcPending){
+          _epgUtc=valueEpoch;_epgUtcMs=millis();_epgUtcPending=false;_epgLocalPending=true;_dabTimeRefreshPending=true;
+        } else {
+#endif
+        Year=value.year;Months=value.month;Days=value.day;Hours=value.hour;Minutes=value.minute;Seconds=value.second;
+        _timeSampleGeneration=dab_scheduler::nextGeneration(_timeSampleGeneration);
+#if EPG_ENABLE
+        if(_epgLocalPending){
+          int16_t offset=0;_epgClock=epg::BroadcastClockSample{};
+          _epgClock.valid=epg::pairedOffsetAfterUtc(_epgUtc,_epgUtcMs,valueEpoch,millis(),offset);
+          _epgClock.encoding=epg::ClockEncoding::UTC;_epgClock.calendarEpoch=_epgUtc;
+          _epgClock.sampledAtMonotonicMs=_epgUtcMs;_epgClock.offsetMinutes=offset;
+          _epgClock.offsetKnown=_epgClock.valid;_epgClock.generation=_generation;
+          _epgLocalPending=false;
+        } else {_epgUtcPending=true;_dabTimeRefreshPending=true;}
+        }
+#endif
       } else ++_commandErrors;
       _state = State::Ready;
       break;
@@ -2313,8 +2397,13 @@ void DAB::scheduleReadyWork(uint32_t now) {
       !_activeDataServiceValid &&
       !_audioActivation.pending() && !_audioActivation.verifying() &&
       dab_scheduler::retryReady(now, _dataServiceRetryNotBeforeMs)) {
-    startDabDataServiceCommand();
-    return;
+    bool spi=false,unknown=false;
+    if(EPG_ENABLE && _epgDiscoveryEnabled) for(unsigned i=0;i<_epgDiscovery.count();++i){const auto& e=_epgDiscovery.entry(i);
+      if(e.sid==_dataServiceId && e.cid()==uint16_t(_dataComponentId)){
+        spi=e.identity==epg_discovery::Identity::Spi && !e.slideshow;unknown=e.identity==epg_discovery::Identity::Unknown;break;}}
+    if(!spi && !unknown){startDabDataServiceCommand();return;}
+    if(spi)_dataServicePending=false;
+
   }
 
   const uint8_t zero = 0;
@@ -2365,13 +2454,18 @@ void DAB::scheduleReadyWork(uint32_t now) {
     if (_epgDiscovery.needsList(now)) _dabServiceListRefreshPending = true;
     _epgDiscovery.refresh(now);
   }
-  const bool epgDue = epgEligible && !urgentDataPending() && _epgDiscovery.due(now);
+  const bool epgDue = epgEligible && _epgDiscovery.due(now) &&
+      (!urgentDataPending() || (uint32_t(now-_epgLastQueryMs)>=1000U &&
+       _dsrvBurstCount>=dab_scheduler::DAB_MAX_DSRV_BURST));
   const bool activationDue=audioRfFresh(now) &&
       (_audioActivation.dueNow(now) || _audioActivation.verificationExpired(now));
   const bool audioInfoDue=valid && _activeServiceValid && _dabAudioRefreshPending &&
       dab_scheduler::retryReady(now,_dabAudioInfoNotBeforeMs);
+  const bool epgStartDue=EPG_ENABLE && epgEligible && epg_live::available() &&
+      !_activeDataServiceValid && !_dataServicePending &&
+      dab_scheduler::retryReady(now,_epgStartNotBefore);
   const bool lowPriorityPending = lowPriorityReady &&
-      (activationDue || epgDue || _deviceEventPending ||
+      (activationDue || epgDue || epgStartDue || _deviceEventPending ||
        (valid && (_dabServiceListRefreshPending ||
                   _dabEnsembleRefreshPending || _dabTimeRefreshPending)) ||
        (valid && _activeServiceValid &&
@@ -2425,7 +2519,8 @@ void DAB::scheduleReadyWork(uint32_t now) {
              State::DabEnsembleCommand, 100000UL, 26);
   } else if (valid && _dabTimeRefreshPending) {
     _dabTimeRefreshPending = false;
-    startRaw(si468x::Command::DAB_GET_TIME, &zero, 1,
+    const uint8_t timeType=_epgUtcPending?1:0;
+    startRaw(si468x::Command::DAB_GET_TIME, &timeType, 1,
              State::DabTimeCommand, 100000UL, 11);
   } else if (valid && _activeServiceValid &&
              _dabAudioRefreshPending && _serviceId != 0 &&
@@ -2448,9 +2543,34 @@ void DAB::scheduleReadyWork(uint32_t now) {
     _dabSubchannelRefreshPending = false;
     startRaw(si468x::Command::DAB_GET_SUBCHAN_INFO, args, sizeof(args),
              State::DabSubchannelCommand, 100000UL, 12);
+  } else if (epgStartDue) {
+    _epgStartNotBefore=now+1000U;
+    const epg_discovery::Endpoint* candidate=nullptr;
+    bool ambiguous=false,pad=false;
+    for(unsigned i=0;i<_epgDiscovery.count();++i) {
+      const auto& e=_epgDiscovery.entry(i);
+      if(e.identity!=epg_discovery::Identity::Spi || e.ca())continue;
+      if(e.pad() && e.sid==_activeServiceId && e.cid()==uint16_t(_activeComponentId))pad=true;
+      if(e.packetMot() && !e.slideshow){if(candidate)ambiguous=true;else candidate=&e;}
+    }
+    if(candidate && !ambiguous && !pad) {
+      _epgStartSid=candidate->sid;_epgStartCid=candidate->cid();
+      uint8_t args[11]={0};si468x::writeLe32(args+3,_epgStartSid);si468x::writeLe32(args+7,_epgStartCid);
+      _epgStartNotBefore=now+60000U;
+      startRaw(si468x::Command::START_DIGITAL_SERVICE,args,sizeof(args),State::EpgStartCommand,100000UL,4);
+    }
+    // UA must still progress when no eligible packet endpoint exists.
+    if(_state!=State::Ready)return;
+    if(epgDue) {
+      const auto* e=_epgDiscovery.issue(now);
+      if(e){_epgLastQueryMs=now;_epgQueryGeneration=_epgDiscovery.generation();
+        uint8_t args[11]={0};si468x::writeLe32(args+3,e->sid);si468x::writeLe32(args+7,e->cid());
+        if(!startRaw(si468x::Command::DAB_GET_COMPONENT_INFO,args,sizeof(args),State::EpgComponentCommand,100000UL,28))processEpgComponentReply(false);}
+    }
   } else if (epgDue) {
     const epg_discovery::Endpoint* endpoint = _epgDiscovery.issue(now);
     if (endpoint) {
+      _epgLastQueryMs=now;
       _epgQueryGeneration = _epgDiscovery.generation();
       uint8_t args[11] = {0};
       si468x::writeLe32(args + 3, endpoint->sid);
@@ -2586,10 +2706,36 @@ void DAB::processDsrvReply() {
     _dsrvPending=_dsrvPending || header.buffersRemaining>0 || si4684IrqEdge;
     return;
   }
+  if(uint32_t(header.byteCount)+24U!=replyLength){
+    ++_commandErrors;_dsrvPending=_dsrvPending || header.buffersRemaining>0 || si4684IrqEdge;return;
+  }
 
   const uint8_t* payload = _workspace + 24;
   MOT_DIAG(++_motDiagnostics.validDsrv;_motDiagnostics.dsrvBytes+=header.byteCount;
     if(header.buffersRemaining>_motDiagnostics.maxBacklog) _motDiagnostics.maxBacklog=header.buffersRemaining);
+  epg_live::backlog(header.buffersRemaining,header.overflow() || header.serviceOverflow());
+  bool epgPacket=false,epgPad=false;
+  for(unsigned i=0;i<_epgDiscovery.count();++i){
+    const auto& e=_epgDiscovery.entry(i);
+    if(e.identity!=epg_discovery::Identity::Spi || e.ca() || e.sid!=header.serviceId ||
+       (e.cid()!=header.componentId && e.wire!=header.componentId))continue;
+    epgPad=header.dataSource==1 && e.pad() && si468x::readLe16(_workspace+16)==dab_ua::SPI &&
+      (header.dscType==0 || header.dscType==60) && _activeServiceValid &&
+      e.sid==_activeServiceId && e.cid()==uint16_t(_activeComponentId);
+    epgPacket=header.dataSource==0 && e.packetMot() && !e.slideshow && !_epgCleanupFailed && header.dscType==60 &&
+      _activeDataServiceValid && e.sid==_activeDataServiceId && e.cid()==uint16_t(_activeDataComponentId);
+    if(epgPad || epgPacket)break;
+  }
+  const bool epgTagged=header.dataSource==1 && si468x::readLe16(_workspace+16)==dab_ua::SPI;
+  if(epgPad || epgPacket || epgTagged || (header.dataSource==0 && _epgDataOwner)){
+    if((header.serviceState==0 || header.serviceState==3) && (epgPad || epgPacket)) {
+      serviceEpg(millis());
+#if EPG_ENABLE
+      if(epgPad || !epg_live::context().pad)epg_live::payload(payload,header.byteCount,millis());
+#endif
+    }
+    _dsrvPending=_dsrvPending || header.buffersRemaining>0 || si4684IrqEdge;return;
+  }
   const bool ownedEpgSource =
       (header.isPad() && _activeServiceValid && header.serviceId == _activeServiceId &&
        header.componentId == _activeComponentId) ||
@@ -3184,6 +3330,8 @@ void DAB::processDabEventReply() {
   }
   if (event.reconfiguration || event.reconfigurationWarning) {
     _epgDiscovery.reset();
+  epg_live::context(epg_live::Context{});
+  _epgClock=epg::BroadcastClockSample{};_epgUtcPending=_epgLocalPending=false;
     // A warning pauses activation but is not yet a changed PAD stream.
     if(event.reconfiguration) _generation=dab_scheduler::nextGeneration(_generation);
     _rfParseOk=false;valid=false;_audioRfCheck=false;_audioListKnown=_audioListVersionKnown=false;

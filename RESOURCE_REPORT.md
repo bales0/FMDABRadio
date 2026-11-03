@@ -105,3 +105,45 @@ rozpracované audio opravě +104 B / +1284 B. Nové položky jsou lease/token,
 v jediné původní 51200B aréně. Nezavádí se heap alokace ani další image buffer.
 Volitelná diagnostika má měřených dalších 88 B statické RAM; default je 0.
 Podrobnosti, syntetické časování a HW limity: SLS_MOT_IMPLEMENTATION_REPORT_CZ.md.
+
+## BAND / živé EPG L2/L3 (2026-11-03)
+
+Čistý HEAD 6be3999 nově sestavený v izolovaném TEMP: RAM 112344 B,
+flash 460785 B. Nový default EPG ON: RAM 114064 B, flash 492237 B;
+přírůstek +1720/+31452 B. Stejné nové UI s EPG OFF: 113960/465429 B.
+
+Xtensa sizeof(Core)=14456 B. Živý runtime alokuje 36864 B word-only
+INTERNAL|32BIT|EXEC bufferů a Core v INTERNAL|8BIT: celkem 51320 B heap.
+Zachovává dvě 12288B RX assembly, 4096B directory, 8192B text a 96 pořadů;
+nealokuje nepoužívané EPG logo (úspora 12288 B). Offline plný Core má dále logo.
+SLS 51200 B je již v BSS a JPEG/PNG workspace 76800 B zůstává původní heap blok.
+Velký framebuffer nepřibyl; EPG kreslí jeden změněný pruh na průchod smyčkou.
+
+Brána před inicializací vyžaduje DRAM Core+16000 B reserve a contiguous Core,
+IRAM buffery+4096 B reserve a largest>=12288 B. Částečná alokace se uvolní,
+OOM se do restartu neopakuje a nikdy nedává zelené EPG. Free/largest/min/stack
+za fyzického běhu nejsou zde změřeny; `[EPG/RAM] before/after` a `[EPG/L2]`
+je měří na cíli. Host OOM a statický linker nejsou náhradou HW měření.
+Podrobnosti: IMPLEMENTATION_REPORT_BAND_EPG_LIVE_CZ.md;
+otevřená HW acceptance: TEST_PLAN_EPG_LIVE_HW_CZ.md.
+
+
+## Navazující SELECT/BAND a kompaktní LCD
+
+Výchozí build po opravě potvrzení režimu: RAM 114072 B, flash 493773 B
+(+8/+1536 B proti základní L2/L3 etapě). Pending command je jediný malý stav,
+neexistuje další radio scheduler ani datový buffer. Canvas běžícího textu má
+nadále 260 B; nově se přesunul na y=44..56. CNR a RSSI mají samostatné řádky,
+EPG je vedle RSSI na y=96. Rozměry SLS/decoder/EPG Core arén se nemění.
+Cílové sestavení, UI/Controls/queued-menu a audio testy PASS; HW měření neprovedeno.
+
+
+Aktuální sjednocené menu (CH hodnoty, short SELECT položka, long SELECT uloží
+odchodem, VOL vždy hlasitost) a rezervovaný long BAND: RAM 114072 B, flash
+493393 B. Oproti předchozí opravě se statická RAM nemění, flash -380 B.
+Transport, arény a sběrnice nezměněny; target build, UI/Controls a audio PASS.
+
+
+Finální mapa menu po opravě: CH navigace, VOL hodnoty, krátký SELECT bez akce,
+dlouhý SELECT uložit/odejít. Build PASS: RAM 114072 B, flash 493433 B.
+Statická RAM beze změny; proti předchozí mapě flash +40 B. UI testy PASS.

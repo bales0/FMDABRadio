@@ -19,7 +19,7 @@ void Controls::begin(uint8_t volumeUpPin, uint8_t volumeDownPin, uint8_t scanPin
   configure(0, volumeUpPin, ButtonId::VolumeUp, true, false, true, 0);
   configure(1, volumeDownPin, ButtonId::VolumeDown, true, false, true, 0);
   configure(2, scanPin, ButtonId::Scan, false, true, false, 1000);
-  configure(3, bandPin, ButtonId::Band, false, false, false, 0);
+  configure(3, bandPin, ButtonId::Band, false, true, false, 800);
   configure(4, selectPin, ButtonId::Select, true, true, false, 800);
   configure(5, channelDownPin, ButtonId::ChannelDown, true, false, true, 0);
   configure(6, channelUpPin, ButtonId::ChannelUp, true, false, true, 0);
@@ -46,7 +46,9 @@ void Controls::poll(uint32_t nowMs) {
           push(button.id, ButtonEventType::ShortPress);
         }
       } else if (button.deferShort && !button.longSent) {
-        push(button.id, ButtonEventType::ShortPress);
+        push(button.id, button.longPressMs &&
+            uint32_t(nowMs-button.pressedMs)>=button.longPressMs
+            ? ButtonEventType::LongPress : ButtonEventType::ShortPress);
       }
     }
 
@@ -92,7 +94,8 @@ void Controls::configure(uint8_t index, uint8_t pin, ButtonId id,
   pinMode(pin, usePullup ? INPUT_PULLUP : INPUT);
   button.rawPressed = digitalRead(pin) == LOW;
   button.stablePressed = button.rawPressed;
-  button.longSent = false;
+  // Suppress a key already held at boot until its first release.
+  button.longSent = button.rawPressed;
   button.rawChangedMs = millis();
   button.pressedMs = button.rawChangedMs;
   button.nextRepeatMs = button.rawChangedMs + REPEAT_START_MS;

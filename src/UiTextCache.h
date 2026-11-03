@@ -10,6 +10,8 @@ enum class UiTextField : uint8_t {
 };
 namespace ui_paint {
 struct Rect { int16_t x,y,w,h; };
+constexpr int16_t TextTop=44,TextY=46,AudioY=64,SignalY=80,RssiY=96;
+inline Rect epgBounds(){return {138,94,22,16};}
 template<size_t Capacity> struct Cell {
   char text[Capacity]={};
   uint16_t color=0,clip=0;
@@ -40,10 +42,10 @@ struct ListeningCache {
 inline Rect bounds(UiTextField field,bool dab) {
   static const Rect boxes[]={
     {0,0,28,14},{30,0,88,14},{146,0,14,14},{0,15,160,24},
-    {0,96,26,15},{26,96,49,15},{76,96,32,15},{108,96,52,15},
-    {0,81,160,15},{0,111,18,17},{19,111,22,17},{42,111,28,17},
+    {0,78,26,15},{26,78,134,15},{0,94,32,16},{32,94,104,16},
+    {0,61,160,17},{0,111,18,17},{19,111,22,17},{42,111,28,17},
     {71,111,22,17},{93,111,32,17},{127,111,33,17},
-    {50,81,30,15},{84,81,24,15},{111,81,24,15},{137,81,23,15},
+    {50,61,30,17},{84,61,24,17},{111,61,24,17},{137,61,23,17},
     {0,111,125,17},{120,0,26,14}
   };
   static_assert(sizeof(boxes)/sizeof(boxes[0])==static_cast<uint8_t>(UiTextField::Count),

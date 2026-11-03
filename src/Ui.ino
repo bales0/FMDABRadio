@@ -20,7 +20,7 @@ const uint16_t UI_DIM_TIMEOUT_SECONDS[] = {15, 30, 60, 120};
 constexpr uint16_t UI_GRAY = 0x8410;
 constexpr uint16_t UI_DARK_LINE = 0x3186;
 constexpr uint16_t UI_ORANGE = 0xFD20;
-constexpr uint8_t UI_MENU_ITEMS = 10;
+constexpr uint8_t UI_MENU_ITEMS = 11;
 struct UiListRowCache {
   bool valid = false;
   uint16_t item = 0;
@@ -32,6 +32,7 @@ UiListRowCache stationListRows[UI_LIST_ROWS];
 UiListRowCache menuRows[5];
 bool stationListPainted = false;
 bool menuPainted = false;
+bool paintedMenuModeItem=false;
 bool stationListWasEmpty = false;
 String stationListHeader;
 uint8_t paintedMenuLanguage = 0;
@@ -771,7 +772,7 @@ void pushUiTextStrip(uint16_t color) {
   uint16_t row[160]; // 320 B transient stack, no RGB framebuffer or heap churn.
   prepareTftSpi();
   tft.startWrite();
-  tft.setAddrWindow(0,53,160,13);
+  tft.setAddrWindow(0,ui_paint::TextTop,160,13);
   for(uint8_t y=0;y<13;++y) {
     for(uint16_t x=0;x<160;++x)
       row[x]=(bits[y*20U+x/8U] & (0x80U>>(x&7U))) ? color : ST77XX_BLACK;
@@ -783,13 +784,13 @@ void pushUiTextStrip(uint16_t color) {
 void drawUiTextStrip(const String& text,int16_t x,uint16_t color,uint16_t maxWidth) {
   if(!uiTextCanvas.getBuffer()) {
     // Allocation failure preserves text and radio operation with the old path.
-    tft.fillRect(0,53,screenWidth,13,ST77XX_BLACK);
-    drawUtf8Text(text,x,55,color,1,maxWidth);
+    tft.fillRect(0,ui_paint::TextTop,screenWidth,13,ST77XX_BLACK);
+    drawUtf8Text(text,x,ui_paint::TextY,color,1,maxWidth);
     return;
   }
   uiTextCanvas.fillScreen(0);
   uiTextCanvas.setTextWrap(false);
-  // Global text origin stays y=55. Include the final ogonek/descender row.
+  // One text line, including diacritics; blank padding above and below.
   drawUtf8TextOn(uiTextCanvas,text,x,2,1,1,maxWidth);
   pushUiTextStrip(color);
 }
@@ -797,7 +798,7 @@ void drawUiTextStrip(const String& text,int16_t x,uint16_t color,uint16_t maxWid
 void renderUiTextArea() {
   if (uiView != UiView::Text || scanActive()) return;
   if (uiBroadcastText.length() == 0) {
-    if(uiListeningPaint.broadcast.update("Waiting for broadcast text",0x7BEF,2,55,1,156)) {
+    if(uiListeningPaint.broadcast.update("Waiting for broadcast text",0x7BEF,2,ui_paint::TextY,1,156)) {
       drawUiTextStrip("Waiting for broadcast text",2,0x7BEF,156);
     }
     return;
@@ -806,7 +807,7 @@ void renderUiTextArea() {
   const uint8_t pixelOffset = uiTextScrollGlyph % 6U;
   const String line = uiCircularTextSlice(glyphOffset,
                                            UI_TEXT_LINE_GLYPHS + 2U);
-  if(uiListeningPaint.broadcast.update(line.c_str(),ST77XX_WHITE,2-pixelOffset,55,1,158U+pixelOffset)) {
+  if(uiListeningPaint.broadcast.update(line.c_str(),ST77XX_WHITE,2-pixelOffset,ui_paint::TextY,1,158U+pixelOffset)) {
     drawUiTextStrip(line,2-pixelOffset,ST77XX_WHITE,158U+pixelOffset);
   }
 }
@@ -839,37 +840,41 @@ void renderUiSignal() {
   const int8_t displayedSnr = uiDisplayedSnr();
   const int8_t displayedRssi = uiDisplayedRssi();
   if (dabMode == 1) {
-    renderCachedUiText(UiTextField::SignalLabel, "CNR", 2, 98, ST77XX_CYAN, 1, 24);
+    renderCachedUiText(UiTextField::SignalLabel, "CNR", 2, ui_paint::SignalY, ST77XX_CYAN, 1, 24);
     snprintf(value, sizeof(value), "%d dB", displayedSnr);
-    renderCachedUiText(UiTextField::Snr, String(value), 28, 98, uiSignalColor(displayedSnr, true), 1, 45);
-    renderCachedUiText(UiTextField::RssiLabel, "RSSI", 78, 98, ST77XX_CYAN, 1, 30);
+    renderCachedUiText(UiTextField::Snr, String(value), 28, ui_paint::SignalY, uiSignalColor(displayedSnr, true), 1, 130);
+    renderCachedUiText(UiTextField::RssiLabel, "RSSI", 2, ui_paint::RssiY, ST77XX_CYAN, 1, 30);
     snprintf(value, sizeof(value), "%d%s", uiSignalValue(displayedRssi),
              uiSignalUnitName());
-    renderCachedUiText(UiTextField::Rssi, String(value), 110, 98,
-                 uiRssiColor(displayedRssi, true), 1, 48);
+    renderCachedUiText(UiTextField::Rssi, String(value), 34, ui_paint::RssiY,
+                 uiRssiColor(displayedRssi, true), 1, 100);
 
   } else {
-    renderCachedUiText(UiTextField::SignalLabel, "SNR", 2, 98, ST77XX_CYAN, 1, 24);
+    renderCachedUiText(UiTextField::SignalLabel, "SNR", 2, ui_paint::SignalY, ST77XX_CYAN, 1, 24);
     snprintf(value, sizeof(value), "%d dB", displayedSnr);
-    renderCachedUiText(UiTextField::Snr, String(value), 28, 98, uiSignalColor(displayedSnr, false), 1, 45);
-    renderCachedUiText(UiTextField::RssiLabel, "RSSI", 78, 98, ST77XX_CYAN, 1, 30);
+    renderCachedUiText(UiTextField::Snr, String(value), 28, ui_paint::SignalY, uiSignalColor(displayedSnr, false), 1, 130);
+    renderCachedUiText(UiTextField::RssiLabel, "RSSI", 2, ui_paint::RssiY, ST77XX_CYAN, 1, 30);
     snprintf(value, sizeof(value), "%d%s", uiSignalValue(displayedRssi),
              uiSignalUnitName());
-    renderCachedUiText(UiTextField::Rssi, String(value), 110, 98,
-                 uiRssiColor(displayedRssi, false), 1, 48);
+    renderCachedUiText(UiTextField::Rssi, String(value), 34, ui_paint::RssiY,
+                 uiRssiColor(displayedRssi, false), 1, 100);
   }
 }
 
 void renderUiStatusStatic() {
   if (scanActive() || uiView != UiView::Text) return;
   if(!uiListeningPaint.statusLine) {
-    tft.drawFastHLine(0,80,screenWidth,UI_DARK_LINE);
+    tft.drawFastHLine(0,60,screenWidth,UI_DARK_LINE);
     uiListeningPaint.statusLine=true;
   }
   char value[32];
   if (dabMode == 1) {
     static const char* const shortAudioMode[] = {"DUAL", "MONO", "ST", "J-ST"};
-    if (Dab.bitrate == 0U || Dab.samplerate == 0U) {
+    if(menuModeRequestPending) {
+      snprintf(value,sizeof(value),"%s",menuModeRequestTarget?"Switching to DAB...":"Switching to FM...");
+    }else if(menuModeRequestStatus>=2){
+      snprintf(value,sizeof(value),"%s","Mode change failed");
+    }else if (Dab.bitrate == 0U || Dab.samplerate == 0U) {
       snprintf(value, sizeof(value), "%s", Dab.audioActivationFailed() ? "Audio unavailable" : "Audio loading...");
     } else {
       snprintf(value, sizeof(value), "%s %ukbit %ukHz %s",
@@ -877,7 +882,7 @@ void renderUiStatusStatic() {
                Dab.samplerate / 1000U,
                shortAudioMode[static_cast<uint8_t>(Dab.mode) & 0x03U]);
     }
-    renderCachedUiText(UiTextField::Audio, String(value), 2, 83, ST77XX_WHITE, 1, 156);
+    renderCachedUiText(UiTextField::Audio, String(value), 2, ui_paint::AudioY, ST77XX_WHITE, 1, 156);
     renderCachedUiText(UiTextField::Rx, "RX", 2, 113, Dab.valid ? ST77XX_GREEN : ST77XX_RED, 1, 12);
     renderCachedUiText(UiTextField::Fic, "FIC", 20, 113, ST77XX_CYAN, 1, 18);
     const uint8_t displayedQuality = uiDisplayedQuality();
@@ -903,19 +908,19 @@ void renderUiStatusStatic() {
              totalDABchannels);
     renderCachedUiText(UiTextField::StationIndex, String(value), 128, 113, ST77XX_WHITE, 1, 30);
   } else {
-    renderCachedUiText(UiTextField::Audio, Dab.fmPilot ? "STEREO" : "MONO", 2, 83,
+    renderCachedUiText(UiTextField::Audio, menuModeRequestPending?"WAIT":menuModeRequestStatus>=2?"ERR":Dab.fmPilot?"STEREO":"MONO", 2, ui_paint::AudioY,
                  Dab.fmPilot ? ST77XX_GREEN : ST77XX_YELLOW, 1, 44);
     const char* rdsLabel = fmRegionProfile(uiSettings.fmRegion).rbds ? "RBDS" : "RDS";
-    renderCachedUiText(UiTextField::Rds, rdsLabel, 52, 83,
+    renderCachedUiText(UiTextField::Rds, rdsLabel, 52, ui_paint::AudioY,
                  Dab.rdsSync ? ST77XX_GREEN : ST77XX_RED, 1, 24);
-    renderCachedUiText(UiTextField::Tp, "TP", 86, 83, Dab.tp ? ST77XX_GREEN : UI_GRAY, 1, 18);
-    renderCachedUiText(UiTextField::Ta, "TA", 113, 83, Dab.ta ? UI_ORANGE : UI_GRAY, 1, 18);
+    renderCachedUiText(UiTextField::Tp, "TP", 86, ui_paint::AudioY, Dab.tp ? ST77XX_GREEN : UI_GRAY, 1, 18);
+    renderCachedUiText(UiTextField::Ta, "TA", 113, ui_paint::AudioY, Dab.ta ? UI_ORANGE : UI_GRAY, 1, 18);
     uint16_t afColor = UI_GRAY;
     if (uiSettings.fmAfEnabled) {
       afColor = fmAfActive() ? UI_ORANGE
           : (Dab.fmAfList().count != 0 ? ST77XX_GREEN : ST77XX_CYAN);
     }
-    renderCachedUiText(UiTextField::Af, "AF", 139, 83, afColor, 1, 18);
+    renderCachedUiText(UiTextField::Af, "AF", 139, ui_paint::AudioY, afColor, 1, 18);
     snprintf(value, sizeof(value), "PTY %u  PI %04X", Dab.pty, Dab.pi);
     renderCachedUiText(UiTextField::Pty, String(value), 2, 113, UI_GRAY, 1, 92);
     snprintf(value, sizeof(value), "%u/%u", currentFMchannel,
@@ -1011,6 +1016,10 @@ void serviceUiSlideshow() {
 }
 
 void renderCurrentUiView() {
+  if(isInfoView(uiView)){invalidateEpgBadge();invalidateInfoRows();renderInfoView();return;}
+  if(uiView==UiView::Menu){menuPainted=false;renderMenu();return;}
+  if(uiView==UiView::StationList){stationListPainted=false;renderStationList();return;}
+
   if (uiView == UiView::Slideshow && dabMode == 1 &&
              uiSettings.slideshowMode != 0) {
     renderSlideshowScreen();
@@ -1368,9 +1377,14 @@ void renderMenu() {
   if (styleChanged) {
     tft.fillRect(0, 0, screenWidth, 14, ST77XX_BLACK);
     drawUtf8Text(uiText("Settings", "Nastaveni"), 2, 1, uiAccentColor(), 1, 156);
-    tft.fillRect(0, 115, screenWidth, 13, ST77XX_BLACK);
-    drawUtf8Text(uiText("Hold SELECT = back", "Drzet SELECT = zpet"),
-                 2, 116, UI_GRAY, 1, 156);
+  }
+  if(styleChanged || paintedMenuModeItem!=(menuSelection==10)){
+    tft.fillRect(0,115,screenWidth,13,ST77XX_BLACK);
+    const char* help=menuSelection==10?
+      uiText("VOL mode; hold SELECT=OK","VOL rezim; drzet SELECT=OK"):
+      uiText("CH item VOL +/- hold=OK","CH pol VOL +/- drzet=OK");
+    drawUtf8Text(help,2,116,UI_GRAY,1,156);
+    paintedMenuModeItem=menuSelection==10;
   }
   menuPainted = true;
   paintedMenuLanguage = uiSettings.language;
@@ -1379,11 +1393,11 @@ void renderMenu() {
   const char* labelsEn[UI_MENU_ITEMS] = {
       "Brightness", "Dim level", "Dim after", "Slideshow",
       "FM region", "FM AF", "Signal units", "Theme", "Language",
-      "Serial control"};
+      "Serial control", "Radio mode"};
   const char* labelsCs[UI_MENU_ITEMS] = {
       "Jas", "Jas v klidu", "Ztlumit za", "Slideshow",
       "FM oblast", "FM AF", "Jednotky", "Motiv", "Jazyk",
-      "Seriove rizeni"};
+      "Seriove rizeni", "Rezim radia"};
   if (menuSelection < menuTop) menuTop = menuSelection;
   if (menuSelection >= menuTop + visibleItems) {
     menuTop = menuSelection - visibleItems + 1;
@@ -1420,6 +1434,7 @@ void renderMenu() {
                         (uiSettings.theme == 1 ? "Amber" : "Ice")); break;
       case 8: snprintf(value, sizeof(value), "%s",
                         uiSettings.language == 0 ? "English" : "Cestina"); break;
+      case 10: snprintf(value,sizeof(value),"%s",menuModeCandidate?"DAB":"FM");break;
       default: snprintf(value, sizeof(value), "%s",
                         uiSettings.serialControl ? "On" : "Off"); break;
     }
@@ -1450,6 +1465,9 @@ void applyUiBacklightSettings() {
 }
 
 void adjustMenu(int8_t direction) {
+  if(menuSelection==10){menuModeRequestPending=false;menuModeRequestStatus=0;
+    menuModeCandidate=!menuModeCandidate;renderMenu();return;}
+
   switch (menuSelection) {
     case 0:
       uiSettings.brightness = constrain(
@@ -1508,13 +1526,14 @@ void adjustMenu(int8_t direction) {
       break;
   }
   applyUiBacklightSettings();
-  saveUiSettingsDelayed();
   renderMenu();
 }
 
 void openSettingsMenu() {
   menuPainted = false;
-  uiViewBeforeModal = uiView == UiView::Slideshow ? uiView : UiView::Text;
+  uiMenuReturn=uiView;
+  menuModeCandidate=dabMode;
+  menuModeRequestPending=false;menuModeRequestStatus=0;
   uiView = UiView::Menu;
   menuSelection = 0;
   menuTop = 0;
@@ -1537,14 +1556,47 @@ void redrawLcdDiagnostic() {
 }
 
 void closeSettingsMenu() {
-  const bool fmRegionChanged =
-      sanitizeFmRegion(uiSettings.fmRegion) != menuFmRegionOnOpen;
+  menuModeRequestPending=false;menuModeRequestStatus=0;
+  const bool fmRegionChanged=sanitizeFmRegion(uiSettings.fmRegion)!=menuFmRegionOnOpen;
+  const bool modeChanged=menuModeCandidate!=dabMode;
   saveUiSettingsDelayed();
-  uiView = uiViewBeforeModal;
-  if (fmRegionChanged) {
+  uiView=modeChanged?UiView::Text:uiMenuReturn;
+  if(isInfoView(uiView) && (Dab.contextGeneration()!=uiInfoGeneration || Dab.transitionActive() || scanActive()))
+    uiView=UiView::Text;
+  if(modeChanged){
+    menuModeRequestPending=true;menuModeRequestStatus=1;
+    menuModeRequestTarget=menuModeCandidate;menuModeRequestGeneration=Dab.contextGeneration();
+    menuModeRequestDeadline=millis()+3000U;
+    serialMonitor.println("[MENU] settings confirmed on exit; mode queued");
+    renderCurrentUiView();serviceMenuModeCommit(millis());
+  }else if(fmRegionChanged){
     applyFmRegionSelection();
-  } else {
+  }else{
     renderCurrentUiView();
+  }
+}
+
+void serviceMenuModeCommit(uint32_t now) {
+  if(!menuModeRequestPending)return;
+  if(Dab.contextGeneration()!=menuModeRequestGeneration || scanActive() ||
+     uiBandStarting || fmAfActive() || Dab.transitionActive()){
+    menuModeRequestPending=false;menuModeRequestStatus=3;
+    serialMonitor.println("[MENU] mode request cancelled: context changed");markUiDirty(UI_DIRTY_STATUS);return;
+  }
+  if(static_cast<int32_t>(now-menuModeRequestDeadline)>=0){
+    menuModeRequestPending=false;menuModeRequestStatus=2;
+    serialMonitor.println("[MENU] mode request expired; reopen Settings to retry");markUiDirty(UI_DIRTY_STATUS);return;
+  }
+  if(Dab.busy())return;
+  const uint8_t target=menuModeRequestTarget;
+  menuModeRequestPending=false;menuModeRequestStatus=0;
+  if(target==dabMode){markUiDirty(UI_DIRTY_STATUS);return;}
+  if(sanitizeFmRegion(uiSettings.fmRegion)!=menuFmRegionOnOpen)refreshFmDatabaseForRegion();
+  menuModePrevious=dabMode;dabMode=target;menuBandCommitPending=true;
+  if(!startBandTransition()){
+    dabMode=menuModePrevious;menuBandCommitPending=false;menuModeRequestStatus=3;
+    uiView=UiView::Text;renderCurrentUiView();
+    serialMonitor.println("[MENU] mode start rejected; previous mode retained");
   }
 }
 
@@ -1553,10 +1605,10 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
                     event.type == ButtonEventType::Repeat;
   if (uiView == UiView::Menu) {
     if (event.button == ButtonId::ChannelUp && step) {
-      menuSelection = (menuSelection + 1) % UI_MENU_ITEMS;
+      menuSelection=(menuSelection+1)%UI_MENU_ITEMS;
       renderMenu();
     } else if (event.button == ButtonId::ChannelDown && step) {
-      menuSelection = menuSelection == 0 ? UI_MENU_ITEMS - 1 : menuSelection - 1;
+      menuSelection=menuSelection==0?UI_MENU_ITEMS-1:menuSelection-1;
       renderMenu();
     } else if (event.button == ButtonId::VolumeUp && step) {
       adjustMenu(1);
@@ -1564,13 +1616,15 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
       adjustMenu(-1);
     } else if (event.button == ButtonId::Select &&
                event.type == ButtonEventType::ShortPress) {
-      adjustMenu(1);
+      return true; // Deliberately no adjustment, navigation or confirmation.
     } else if (event.button == ButtonId::Select &&
                event.type == ButtonEventType::LongPress) {
       closeSettingsMenu();
     }
     return true;
   }
+
+  if(handleInfoButton(event))return true;
 
   if (uiView == UiView::StationList) {
     if (event.button == ButtonId::ChannelUp && step) {
@@ -1597,20 +1651,14 @@ bool handleUiButtonEvent(const ButtonEvent& event) {
       renderCurrentUiView();
       return true;
     }
-    if (event.button == ButtonId::Band &&
-        event.type == ButtonEventType::ShortPress && Dab.ready()) {
-      openListAfterBandReady = true;
-      dabMode = !dabMode;
-      saveModeToEEPROM(dabMode);
-      startBandTransition();
-      return true;
-    }
+
   }
   return false;
 }
 
 void serviceUi(uint32_t now) {
   serviceUiSignalFilter(now);
+  serviceInfoView(now);
   if (uiBandStarting) return;
   const bool motCollecting = Dab.slideshowCollecting();
   const bool motReceiving = Dab.slideshowReceiving(now);

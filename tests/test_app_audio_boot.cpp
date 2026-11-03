@@ -8,6 +8,10 @@ enum class RadioOperation { None,BandBoot,FmTune,FmSeek,DabTune,DabService };
 enum class UiView { Text,StationList };
 bool uiBandStarting=true,uiBandTunePending=false,uiInitialTuneDeferred=false;
 bool uiDefaultSlideshowPending=false,openListAfterBandReady=false;
+bool menuBandCommitPending=false;
+uint8_t menuModePrevious=1;
+unsigned modeSaves=0;
+void saveModeToEEPROM(uint8_t){++modeSaves;}
 uint32_t uiInitialTuneDeadlineMs=0,clockMs=100;
 uint8_t dabMode=1,totalDABchannels=46,totalFMchannels=15,currentFMchannel=2,vol=52,uiDirtyFlags=0;
 constexpr uint8_t UI_DIRTY_NONE=0;
@@ -56,5 +60,10 @@ int main() {
   // Deadline wraps safely; failure to accept is still bounded.
   clockMs=0xFFFFFF00U;uiBandStarting=true;Dab.bandReady=true;Dab.idle=false;handleRadioEvents();
   clockMs+=3000;handleRadioEvents();assert(!uiBandStarting && !uiInitialTuneDeferred);
+  menuBandCommitPending=true;dabMode=0;uiBandStarting=true;Dab.bandReady=true;
+  handleRadioEvents();assert(modeSaves==1 && !menuBandCommitPending && dabMode==0);
+  menuBandCommitPending=true;menuModePrevious=1;uiBandStarting=true;
+  Dab.results.push_back({RadioOperation::BandBoot,false});handleRadioEvents();
+  assert(modeSaves==1 && dabMode==1 && !menuBandCommitPending && !uiBandStarting);
   puts("Application boot PASS: actual band-ready/deferred/result functions, 3s busy deadline, late acceptance blocked, UI release, millis wrap");
 }

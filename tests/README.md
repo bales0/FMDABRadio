@@ -135,3 +135,20 @@ for Manual/Auto/Off, modal/scan, partial reopen, same-content waiting, failures
 and immutable decoder input. Diagnostics are enabled only for the MOT host
 harness; the default firmware flag is 0 and emits no new periodic output.
 Historical replay now copies matching policy headers as well as driver/header.
+
+## Live EPG L2/L3 and BAND/menu
+
+`run_epg_tests.py` also links the actual driver, live runtime and Core. It feeds
+DSRV packet and UA-confirmed PAD SI/PI groups, checks station identity/Now/Next,
+unchanged partial SLS, full-object freshness, CRC/stale/foreign rejection,
+packet START, bounded STOP quarantine and paired UTC/local time. Five runtime
+allocation failures leave no Core and preserve SLS; default Core logo/OOM tests
+remain. Live ON + discovery OFF is compiled and checked independently.
+
+`run_ui_tests.py` extracts production EpgUi/menu/navigation functions and tests
+160x128 drawing, bounded strip painting, cached EPG badge, UTF-8, modal return,
+candidate/commit/cancel/busy/rollback and CH/volume precedence. It also compiles
+the real Controls state machine for BAND release/800ms/bounce/boot-held/wrap,
+SELECT800 and SCAN1000. No production demo data, COM or automatic flash.
+See IMPLEMENTATION_REPORT_BAND_EPG_LIVE_CZ.md and TEST_PLAN_EPG_LIVE_HW_CZ.md;
+host SPI/TFT tests do not establish physical RF, heap or CTS/FIFO performance.

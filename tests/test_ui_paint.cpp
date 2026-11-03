@@ -19,6 +19,7 @@ enum class UiView { Text,Menu,Slideshow };
 UiView uiView=UiView::Text;
 ui_paint::ListeningCache uiListeningPaint;
 uint8_t dabMode=1,ensemble=0,screenWidth=160,vol=58;
+bool menuModeRequestPending=false;uint8_t menuModeRequestTarget=0,menuModeRequestStatus=0;
 uint16_t stationFM_h=101,stationFM_l=7,currentDABchannel=1,totalDABchannels=46;
 uint16_t currentFMchannel=2,totalFMchannels=15;
 constexpr uint8_t DAB_FREQS=38;
@@ -81,8 +82,8 @@ struct Display {
   void drawFastHLine(int,int,int,uint16_t) {}
   void startWrite() { ++bitmapStarts;transferred.clear(); }
   void setAddrWindow(int x,int y,int w,int h) {
-    assert(x==0 && y==53 && w==160 && h==13);
-    rectangles.push_back({0,53,160,13});
+    assert(x==0 && y==ui_paint::TextTop && w==160 && h==13);
+    rectangles.push_back({0,ui_paint::TextTop,160,13});
   }
   void writePixels(uint16_t* row,unsigned n) {
     assert(n==160);transferred.insert(transferred.end(),row,row+n);
@@ -93,7 +94,7 @@ void drawUtf8Text(const String& text,int16_t x,int16_t y,uint16_t color,uint8_t,
   draws.push_back({text,x,y,color});
 }
 void drawUtf8TextOn(GFXcanvas1&,const String& text,int16_t x,int16_t y,uint16_t color,uint8_t,uint16_t) {
-  assert(color==1);draws.push_back({text,x,y+53,ST77XX_WHITE});
+  assert(color==1);draws.push_back({text,x,y+ui_paint::TextTop,ST77XX_WHITE});
 }
 // PRODUCTION_FUNCTIONS
 
@@ -106,24 +107,27 @@ int main() {
   for(unsigned i=0;i<100;++i) redraw();
   assert(draws.empty() && rectangles.empty());
   ++vol;redraw();assert(draws.size()==1 && draws[0].text=="59");resetSpy();
-  ++snr;redraw();assert(draws.size()==1 && draws[0].x==28 && draws[0].y==98);resetSpy();
-  ++rssi;redraw();assert(draws.size()==1 && draws[0].x==110 && draws[0].y==98);resetSpy();
+  ++snr;redraw();assert(draws.size()==1 && draws[0].x==28 && draws[0].y==ui_paint::SignalY);resetSpy();
+  ++rssi;redraw();assert(draws.size()==1 && draws[0].x==34 && draws[0].y==ui_paint::RssiY);resetSpy();
   quality=88;redraw();assert(draws.size()==1 && draws[0].text=="88%");resetSpy();
   Dab.progress=96;redraw();assert(draws.size()==1 && draws[0].text=="96%");resetSpy();
   Dab.valid=false;redraw();assert(draws.size()==1 && draws[0].text=="RX");resetSpy();
-  Dab.bitrate=128;redraw();assert(draws.size()==1 && draws[0].y==83);resetSpy();
+  Dab.bitrate=128;redraw();assert(draws.size()==1 && draws[0].y==ui_paint::AudioY);resetSpy();
   Dab.bitrate=Dab.samplerate=0;redraw();
   assert(draws.size()==1 && draws[0].text=="Audio loading...");resetSpy();
   Dab.audioFailed=true;redraw();assert(draws.size()==1 && draws[0].text=="Audio unavailable");resetSpy();
   Dab.audioFailed=false;Dab.bitrate=48;Dab.samplerate=48000;redraw();
   assert(draws.size()==1 && draws[0].text.find("48kbit")!=std::string::npos);resetSpy();
+  menuModeRequestPending=true;redraw();assert(draws.size()==1 && draws[0].text=="Switching to FM...");resetSpy();
+  menuModeRequestPending=false;menuModeRequestStatus=2;redraw();assert(draws.size()==1 && draws[0].text=="Mode change failed");resetSpy();
+  menuModeRequestStatus=0;redraw();resetSpy();
   Dab.receiving=false;redraw();
   assert(draws.size()==2 && draws[0].text=="MOT" && draws[1].text=="--");resetSpy();
   Dab.available=true;redraw();
   assert(draws.size()==2 && draws[1].text=="OK" && draws[1].color==ST77XX_GREEN);resetSpy();
   uiBroadcastText="Changed text";redraw();
-  assert(draws.size()==1 && draws[0].y==55 && rectangles.size()==1 && rectangles[0].h==13);resetSpy();
-  ++uiTextScrollGlyph;redraw();assert(draws.size()==1 && draws[0].y==55);resetSpy();
+  assert(draws.size()==1 && draws[0].y==ui_paint::TextY && rectangles.size()==1 && rectangles[0].h==13);resetSpy();
+  ++uiTextScrollGlyph;redraw();assert(draws.size()==1 && draws[0].y==ui_paint::TextY);resetSpy();
   stationName="Changed station";redraw();
   assert(draws.size()==1 && draws[0].y==16 && rectangles[0].h==24);resetSpy();
   uiView=UiView::Menu;redraw();assert(draws.empty());
@@ -131,6 +135,12 @@ int main() {
   dabMode=0;invalidateListeningPaint();redraw();resetSpy();redraw();assert(draws.empty());
   uiSettings.fmAfEnabled=true;Dab.af.count=1;redraw();
   assert(draws.size()==1 && draws[0].text=="AF");resetSpy();
+  const auto badge=ui_paint::epgBounds();
+  for(auto field:{UiTextField::SignalLabel,UiTextField::Snr,UiTextField::RssiLabel,UiTextField::Rssi,UiTextField::Audio}){
+    const auto box=ui_paint::bounds(field,true);
+    assert(box.x+box.w<=badge.x || badge.x+badge.w<=box.x || box.y+box.h<=badge.y || badge.y+badge.h<=box.y);
+  }
+  assert(ui_paint::TextTop>40 && ui_paint::TextTop+13<60);
   ui_paint::Cell<8> unicode;
   assert(unicode.update(u8"Žď",1,0,0,1,20));
   assert(!unicode.update(u8"Žď",1,0,0,1,20));

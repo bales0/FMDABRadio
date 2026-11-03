@@ -11,6 +11,7 @@ enum class Status : uint8_t { Pending, Absent, Confirmed, Incomplete };
 struct Endpoint {
   uint32_t sid=0, wire=0;
   Identity identity=Identity::Unknown;
+  bool slideshow=false;
   uint16_t cid() const { return static_cast<uint16_t>(wire); }
   bool packetMot() const { return ((wire>>14)&3U)==3U && ((wire>>18)&63U)==60U; }
   bool pad() const { return ((wire>>14)&3U)==0U; }
@@ -63,6 +64,7 @@ class Discovery {
       for(unsigned j=0;j<n;++j,++index,offset+=4) {
         entries_[index].sid=sid;entries_[index].wire=le32(raw+offset);
         entries_[index].identity=Identity::Unknown;
+        entries_[index].slideshow=false;
       }
     }
     next_=now+GapMs;refresh_=now+RefreshMs;return true;
@@ -70,7 +72,8 @@ class Discovery {
   void refresh(uint32_t now) {
     if(!loaded_ || active_ || !finished() || !reached(now,refresh_)) return;
     if(++generation_==0) ++generation_;
-    for(unsigned i=0;i<count_;++i) entries_[i].identity=Identity::Unknown;
+    // Same inventory: retain confirmed evidence while re-querying. Only a new
+    // inventory/context or an explicit negative/failed answer revokes it.
     cursor_=0;next_=now;refresh_=now+RefreshMs;
   }
   bool due(uint32_t now) const { return loaded_ && !active_ && cursor_<count_ && reached(now,next_); }
@@ -81,9 +84,13 @@ class Discovery {
   bool commit(uint32_t token,const uint8_t* ua,size_t bytes,uint8_t count,bool ok,uint32_t now) {
     if(token!=generation_ || !active_) return false;
     Identity identity=Identity::Failed;
+    entries_[cursor_].slideshow=false;
     if(ok && dab_ua::valid(ua,bytes,count)) {
       identity=Identity::Other;dab_ua::Reader reader(ua,bytes,count);dab_ua::Application app;
-      while(reader.next(app)) if(app.type==dab_ua::SPI) identity=Identity::Spi;
+      while(reader.next(app)) {
+        if(app.type==dab_ua::SPI) identity=Identity::Spi;
+        if(app.type==dab_ua::SLIDESHOW)entries_[cursor_].slideshow=true;
+      }
     }
     entries_[cursor_].identity=identity;++cursor_;active_=false;next_=now+GapMs;
     if(finished()) refresh_=now+RefreshMs;

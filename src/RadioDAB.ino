@@ -204,7 +204,7 @@ enum class UiView : uint8_t {
   Tech,
   Tune,
   StationList,
-  Menu
+  Menu, EpgNow, EpgList, EpgDetail, FmRds, FmInfo
 };
 
 enum UiDirtyRegion : uint8_t {
@@ -298,6 +298,15 @@ bool stationPreviewActive = false;
 bool openListAfterBandReady = false;
 uint16_t stationListSelection = 1;
 uint16_t stationListTop = 1;
+UiView uiMenuReturn=UiView::Text;
+UiView uiInfoReturn=UiView::Text;
+uint8_t menuModeCandidate=1,menuModePrevious=1;
+bool menuBandCommitPending=false;
+bool menuModeRequestPending=false;
+uint8_t menuModeRequestTarget=1,menuModeRequestStatus=0;
+uint32_t menuModeRequestGeneration=0,menuModeRequestDeadline=0;
+uint32_t uiInfoGeneration=0;
+uint16_t uiEpgSelection=0,uiEpgScroll=0;
 uint8_t menuSelection = 0;
 uint8_t menuTop = 0;
 String uiBroadcastText;
@@ -768,9 +777,19 @@ void setup() {
 void loop() {
   serialMonitor.service();
   Dab.setEpgDiscoveryEnabled(dabMode == 1 && !scanActive() && !uiBandStarting);
+  // Claim an idle command slot before background work can take it again.
+  serviceMenuModeCommit(millis());
   Dab.task();
 
   const uint32_t now = millis();
+  Dab.serviceEpg(now);
+#if EPG_ENABLE
+  if(epg_live::context().stable && epg_live::context().present && !epg_live::available() && !epg_live::oom()){
+    logEpgMemory("before");epg_live::ensure();logEpgMemory("after");
+  }
+#endif
+  epg_live::pump(now);
+  serviceEpgDiagnostics(now);
   backlight.service(now);
   commitDirtySettingsIfDue();
   controls.poll(now);
@@ -1047,7 +1066,10 @@ void serviceSerialControl() {
 void handleButtonEvent(const ButtonEvent& event) {
   const uint32_t now = millis();
   backlight.noteActivity(now);
+  // Long BAND is reserved; do not defer it through AF or trigger a short action.
+  if(event.button==ButtonId::Band && event.type!=ButtonEventType::ShortPress)return;
   if (uiBandStarting) return;
+  if(event.button==ButtonId::Band && (scanActive() || fmAfActive() || Dab.transitionActive()))return;
   if (fmAfActive()) {
     if (fm_af::shouldDeferUserEvent(true, fmAfDeferredEventPending)) {
       fmAfDeferredEvent = event;
@@ -1097,21 +1119,8 @@ void handleButtonEvent(const ButtonEvent& event) {
     return;
   }
 
-  if (event.button == ButtonId::Band &&
-      event.type == ButtonEventType::ShortPress) {
-    if (scanActive()) {
-      cancelFullScan(true);
-      return;
-    }
-    if (!Dab.ready()) {
-      serialMonitor.println("[KEY] band switch ignored while radio is busy");
-      return;
-    }
-    dabMode = !dabMode;
-    saveModeToEEPROM(dabMode);
-    startBandTransition();
-    return;
-  }
+  // BAND is exclusively informational; it never changes mode or cancels a scan.
+  if(event.button==ButtonId::Band)return;
 
   if (event.button == ButtonId::Scan) {
     if (scanActive()) {
@@ -1268,6 +1277,8 @@ void refreshStoredDabMuxLabels() {
 
 void handleRadioEvents() {
   if (Dab.takeBandReady()) {
+    if(menuBandCommitPending){saveModeToEEPROM(dabMode);menuBandCommitPending=false;}
+
     // Every image boot, including radio recovery, invalidates the device's
     // volume register. Apply it here once, even when opening an empty list.
     Dab.requestVolume(scanActive() ? 0 : vol);
@@ -1314,6 +1325,8 @@ void handleRadioEvents() {
 
     if (uiBandStarting) {
       if (operation == RadioOperation::BandBoot && !success) {
+        if(menuBandCommitPending){dabMode=menuModePrevious;menuBandCommitPending=false;}
+
         uiBandStarting = false;
         uiBandTunePending = false;
         clearScreen();

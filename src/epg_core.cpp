@@ -132,13 +132,13 @@ int Assembly::add(uint16_t id, uint16_t seg, bool final, Bytes p, uint16_t n,
   return stride && wanted && mask==wanted ? 1:0;
 }
 Core::Core() : Core(::malloc, ::free) {}
-Core::Core(Allocate allocate, Release release) : release_(release) {
+Core::Core(Allocate allocate, Release release, bool wordOnly, bool logos) : release_(release),logosEnabled_(logos) {
   if(!allocate || !release_) return;
-  bodies_[0]=Buffer(allocate(kObjectBytes));
-  if(bodies_[0]) bodies_[1]=Buffer(allocate(kObjectBytes));
-  if(bodies_[1]) directory_=Buffer(allocate(kDirectoryBytes));
-  if(directory_) logo_=Buffer(allocate(kObjectBytes));
-  if(logo_) text_=Buffer(allocate(kTextBytes));
+  bodies_[0]=Buffer(allocate(kObjectBytes),wordOnly);
+  if(bodies_[0]) bodies_[1]=Buffer(allocate(kObjectBytes),wordOnly);
+  if(bodies_[1]) directory_=Buffer(allocate(kDirectoryBytes),wordOnly);
+  if(directory_ && logosEnabled_) logo_=Buffer(allocate(kObjectBytes),wordOnly);
+  if(directory_ && (logo_ || !logosEnabled_)) text_=Buffer(allocate(kTextBytes),wordOnly);
   body_=bodies_[0];
   if(text_) text_.zero(kTextBytes);
   if(!ready()) releaseBuffers();
@@ -519,14 +519,16 @@ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
   if(e.type&128){increment(stats.unsupported);return Feed::Accepted;}
   if(e.size>kObjectBytes){increment(stats.oversize);return Feed::Accepted;}
   if(e.seen && e.epoch==cacheEpoch_){
-    increment(stats.duplicate);
-    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && contexts_[context_].haveData){if(!fresh())++revision;contexts_[context_].touched=now;}
-    return Feed::Accepted;
+    // Revalidate whole SI/PI objects periodically, including reused TIDs.
+    // A lone duplicate fragment must not extend programme freshness.
+    if(e.type!=7 || uint32_t(now-e.validatedAt)<60000U){
+      increment(stats.duplicate);return Feed::Accepted;
+    }
   }
   const Service* service=station();
   const bool pi=relevantPI(e);
   const bool si=e.type==7 && e.subtype==0;
-  const bool png=e.type==2 && e.subtype==3 && service && !service->conflict && service->png && !logoSize() && !strcmp(service->logo,e.name);
+  const bool png=logosEnabled_ && e.type==2 && e.subtype==3 && service && !service->conflict && service->png && !logoSize() && !strcmp(service->logo,e.name);
   if((focus_ && focus_!=h.tid) || (!focus_ && !pi && !si && !png))return Feed::Accepted;
   int slot=-1;
   for(unsigned i=0;i<2;++i)if(assembly(i).active && assembly(i).tid==h.tid)slot=int(i);
@@ -700,6 +702,7 @@ void Core::attribute(uint8_t tag,Bytes p,size_t n) {
 }
 void Core::completeObject() {
   Entry& e=entries_[objectIndex_];
+  e.validatedAt=monotonicMs_;increment(stats.validUpdates);
   if(!e.seen) { increment(stats.objects); if(rootService_) increment(stats.si); else increment(stats.pi);
     if(observer.object) observer.object(observer.user,e.tid,4,body_,objectLength_);
   }

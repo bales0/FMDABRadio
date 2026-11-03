@@ -8,7 +8,7 @@
 uint32_t hostMillis=100;int hostPins[256];std::vector<HostEvent> hostEvents;
 HostSPI SPI;HostESP ESP;unsigned hostHeapAllocations=0;
 DAB Dab;
-enum class UiView { Text,Menu,StationList,Slideshow };
+enum class UiView { Text,Menu,StationList,Slideshow,EpgNow,EpgList,EpgDetail };
 UiView uiView=UiView::Text;
 uint8_t dabMode=1,screenWidth=160,screenHeight=128;
 bool uiSlideshowDecodePending=false,scanning=false;
@@ -71,6 +71,13 @@ bool renderRamSlideshow(Tft&,const uint8_t* data,uint32_t size,int,int,int,int,S
 }
 // PRODUCTION_FUNCTIONS
 int main() {
+  for(auto view:{UiView::EpgNow,UiView::EpgList,UiView::EpgDetail}){
+    DabHostAccess::reset();uiSettings.slideshowMode=2;uiView=view;
+    DabHostAccess::image(101,21);serviceUiSlideshow();
+    assert(uiView==view && renders==0 && uiSlideshowDecodePending && !DabHostAccess::owned());
+    DabHostAccess::image(102,22);serviceUiSlideshow();assert(uiView==view && renders==0);
+    uiView=UiView::Text;serviceUiSlideshow();assert(visibleTag==22 && renders==1);
+  }
   for(uint8_t mode:{1,2}) {
     DabHostAccess::reset();uiSettings.slideshowMode=mode;
     DabHostAccess::image(1,1);serviceUiSlideshow();

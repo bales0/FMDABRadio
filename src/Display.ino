@@ -116,6 +116,7 @@ void ServiceData(void)
 void clearScreen(void) 
 {
   invalidateListeningPaint();
+  invalidateEpgBadge();
   prepareTftSpi();
   tft.fillScreen(ST77XX_BLACK);
 }

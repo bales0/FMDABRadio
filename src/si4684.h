@@ -31,6 +31,7 @@
 #include "fm_features.h"
 #include "epg_discovery.h"
 #include "EpgConfig.h"
+#include "epg_live.h"
 
 constexpr uint8_t DAB_MAX_SERVICES = 32;
 constexpr uint16_t DAB_MAX_SERVICEDATA_LEN = 129;
@@ -115,11 +116,14 @@ class DAB {
   void cancelAudioActivation();
   bool audioActivationFailed() const;
   void setEpgDiscoveryEnabled(bool enabled);
+  void serviceEpg(uint32_t now);
   void requestVolume(uint8_t volume);
   void task();
 
   bool ready() const;
   bool busy() const;
+  uint32_t contextGeneration() const { return _generation; }
+  bool transitionActive() const { return _operation!=RadioOperation::None || _serviceTransitionPending; }
   uint8_t band() const;
   bool takeBandReady();
   bool takeOperationResult(RadioOperation& operation, bool& success);
@@ -263,6 +267,7 @@ class DAB {
     DabServiceInfoCommand,
     DabSubchannelCommand,
     EpgComponentCommand,
+    EpgStartCommand,
     DsrvCommand,
     Failed
   };
@@ -343,6 +348,13 @@ class DAB {
   epg_discovery::Discovery _epgDiscovery;
   uint32_t _epgQueryGeneration=0;
   bool _epgDiscoveryEnabled=false;
+  bool _epgDataOwner=false;
+  bool _epgCleanupFailed=false;
+  uint32_t _epgStartSid=0,_epgStartCid=0,_epgStartNotBefore=0;
+  uint32_t _epgLastQueryMs=0;
+  bool _epgUtcPending=false,_epgLocalPending=false;
+  uint32_t _epgUtc=0,_epgUtcMs=0;
+  epg::BroadcastClockSample _epgClock;
   Stream* _diagnostics;
   void (*_callback)(void);
 

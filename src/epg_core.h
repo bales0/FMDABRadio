@@ -12,21 +12,60 @@
 namespace epg {
 static const size_t kObjectBytes = 12288, kDirectoryBytes = 4096;
 static const size_t kMaxGroup = 4071, kMaxEntries = 80, kMaxProgrammes = 96, kTextBytes = 8192;
-// Byte-addressable DRAM only; no word-only IRAM adapter in this target.
-using Bytes = radio_data::Bytes;
-class Buffer : public Bytes {
-  uint8_t* data_;
+inline void increment(uint32_t& value) { if(value!=UINT32_MAX)++value; }
+// Read-only bytes without exposing a byte pointer to word-only ESP32 IRAM.
+// Volatile aligned word accesses prevent the compiler from narrowing loads.
+class Bytes {
+ protected:
+  const uint8_t* bytes_=nullptr;
+  const volatile uint32_t* words_=nullptr;
+  size_t offset_=0;
+  __attribute__((noinline)) static uint32_t loadWord(const volatile uint32_t* p) { return *p; }
  public:
-  Buffer(void* data=nullptr):Bytes(static_cast<uint8_t*>(data)),data_(static_cast<uint8_t*>(data)) {}
-  void* allocation() const { return data_; }
-  void set(size_t i,uint8_t value) { data_[i]=value; }
-  void zero(size_t n) { memset(data_,0,n); }
-  void write(size_t offset,Bytes source,size_t n) { source.copyTo(data_+offset,n); }
-  void move(size_t to,size_t from,size_t n) { memmove(data_+to,data_+from,n); }
+  Bytes() = default;
+  Bytes(const uint8_t* p) : bytes_(p) {}
+  static Bytes words(const volatile uint32_t* p) { Bytes b; b.words_=p; return b; }
+  explicit operator bool() const { return bytes_ || words_; }
+  uint8_t operator[](size_t i) const {
+    i+=offset_;
+    return words_?uint8_t(loadWord(words_+(i>>2))>>((i&3)*8)):bytes_[i];
+  }
+  Bytes operator+(size_t offset) const { Bytes b=*this; b.offset_+=offset; return b; }
+  void copyTo(void* destination,size_t n) const {
+    uint8_t* out=static_cast<uint8_t*>(destination);
+    for(size_t i=0;i<n;++i) out[i]=(*this)[i];
+  }
+  bool equals(Bytes other,size_t n) const { for(size_t i=0;i<n;++i) if((*this)[i]!=other[i]) return false; return true; }
 };
-inline void increment(uint32_t& value) { if(value!=UINT32_MAX) ++value; }
-using radio_data::crc16;
-using radio_data::crc32;
+class Buffer : public Bytes {
+  __attribute__((noinline)) static void storeWord(volatile uint32_t* p,uint32_t value) { *p=value; }
+ public:
+  Buffer() = default;
+  Buffer(uint8_t* p) : Bytes(p) {}
+  Buffer(void* p,bool wordOnly) {
+    if(wordOnly) words_=static_cast<uint32_t*>(p); else bytes_=static_cast<uint8_t*>(p);
+  }
+  void* allocation() const { return words_?static_cast<void*>(const_cast<uint32_t*>(words_)):const_cast<uint8_t*>(bytes_); }
+  void set(size_t i,uint8_t value) {
+    i+=offset_;
+    if(words_) {
+      volatile uint32_t* p=const_cast<volatile uint32_t*>(words_)+(i>>2);
+      const unsigned shift=(i&3)*8;
+      storeWord(p,(loadWord(p)&~(uint32_t(255)<<shift))|(uint32_t(value)<<shift));
+    } else const_cast<uint8_t*>(bytes_)[i]=value;
+  }
+  void zero(size_t n) {
+    if(words_) for(size_t i=0;i<n/4;++i) storeWord(const_cast<volatile uint32_t*>(words_)+i,0);
+    else for(size_t i=0;i<n;++i) set(i,0);
+  }
+  void write(size_t offset,Bytes source,size_t n) { for(size_t i=0;i<n;++i) set(offset+i,source[i]); }
+  void move(size_t destination,size_t source,size_t n) {
+    if(destination<source) for(size_t i=0;i<n;++i) set(destination+i,(*this)[source+i]);
+    else while(n) { --n; set(destination+n,(*this)[source+n]); }
+  }
+};
+inline uint16_t crc16(Bytes data,size_t n) { uint16_t c=0xffff; for(size_t i=0;i<n;++i) { c^=uint16_t(data[i])<<8; for(unsigned b=0;b<8;++b)c=uint16_t((c<<1)^((c&0x8000)?0x1021:0)); } return c^0xffff; }
+inline uint32_t crc32(Bytes data,size_t n) { uint32_t c=0xffffffff; for(size_t i=0;i<n;++i) { c^=data[i];for(unsigned b=0;b<8;++b)c=(c>>1)^(0xedb88320U&(0U-(c&1U))); } return c^0xffffffff; }
 uint32_t epoch(int year, unsigned month, unsigned day, unsigned hour=0, unsigned minute=0, unsigned second=0);
 void calendar(uint32_t seconds, int& year, unsigned& month, unsigned& day);
 bool parseIso(const char* text, uint32_t& utc, int16_t& offsetMinutes);
@@ -56,6 +95,7 @@ struct Service {
 };
 struct Entry {
   uint32_t size=0, start=0, stop=0;
+  uint32_t validatedAt=0;
   uint64_t bearer=0;
   uint16_t tid=0, subtype=0, epoch=0;
   int16_t startLto=0, stopLto=0;
@@ -72,6 +112,7 @@ struct CachedProgramme {
   uint8_t context=0;
 };
 struct Stats {
+  uint32_t validUpdates=0;
   uint32_t frames=0, crcBad=0, invalid=0, duplicate=0, conflict=0, incomplete=0;
   uint32_t unmapped=0, oversize=0, unsupported=0, continuityJumps=0;
   uint8_t lastContinuity[2]={255,255}, lastRepetition[2]={}, lastMotRepetition=0;
@@ -116,12 +157,12 @@ class Core {
   typedef void* (*Allocate)(size_t);
   typedef void (*Release)(void*);
   Core();
-  Core(Allocate allocate, Release release);
+  Core(Allocate allocate, Release release, bool wordOnly=false, bool logos=true);
   ~Core();
   Core(const Core&) = delete;
   Core& operator=(const Core&) = delete;
-  bool ready() const { return bodies_[0] && bodies_[1] && directory_ && logo_ && text_; }
-  static size_t bufferBytes() { return 3*kObjectBytes+kDirectoryBytes+kTextBytes; }
+  bool ready() const { return bodies_[0] && bodies_[1] && directory_ && (logo_ || !logosEnabled_) && text_; }
+  static size_t bufferBytes(bool logos=true) { return (logos?3:2)*kObjectBytes+kDirectoryBytes+kTextBytes; }
   static size_t memoryBytes() { return sizeof(Core)+bufferBytes(); }
   static size_t largestBlock() { return sizeof(Core)>kObjectBytes?sizeof(Core):kObjectBytes; }
   void reset();
@@ -177,6 +218,7 @@ class Core {
   // Allocate only at construction; separate bounded blocks tolerate ESP32 heap regions.
   void releaseBuffers();
   Release release_;
+  bool logosEnabled_;
   Buffer body_, bodies_[2], directory_, logo_;
   Entry entries_[kMaxEntries];
   Service services_[16];

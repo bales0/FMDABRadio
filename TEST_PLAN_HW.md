@@ -110,3 +110,9 @@ recyklované TID, partial reopen, RF pauza, discovery ON/OFF a kontrola
 CTS/overflow/RAM je v SLS_MOT_IMPLEMENTATION_REPORT_CZ.md. Na HW neprovedeno.
 Při dalším objektu může jediná aréna přestat obsahovat komprimované A; už
 vykreslené A zůstává v GRAM a SELECT během partial B používá čekací obrazovku.
+# Živé EPG a nové BAND/menu
+
+Navazující konkrétní protokol pro L2/L3, 11A/11B, packet/PAD, skutečné SI/PI,
+barvy EPG, paměťovou bránu a nové ovládání je v `TEST_PLAN_EPG_LIVE_HW_CZ.md`.
+Host testy a cílové sestavení prošly; živý příjem a fyzická RAM/CTS acceptance
+zůstávají neověřené. Bez automatického flash/COM.

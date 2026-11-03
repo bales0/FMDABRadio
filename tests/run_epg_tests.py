@@ -36,7 +36,19 @@ def main():
                         str(ROOT / 'tests/test_epg_discovery.cpp'), str(ROOT / 'src/si4684.cpp'),
                         '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True)
-        print('EPG L0 + L1 host suites PASS (no hardware access)', flush=True)
+        for discovery in [1,0]:
+            exe = output / f'live_{discovery}.exe'
+            subprocess.run([args.cxx, '-std=c++11', '-Wall', '-Wextra', '-Werror', '-pedantic',
+                            '-DEPG_ENABLE=1', f'-DEPG_DISCOVERY_ENABLE={discovery}', '-DFMDAB_HOST_TEST', '-DFMDAB_EPG_TEST_ALLOCATOR', '-Wno-error=switch',
+                            '-I' + str(ROOT / 'tests/radio_shims'), '-I' + str(ROOT / 'tests/host_shims'),
+                            '-I' + str(ROOT / 'src'), str(ROOT / 'tests/test_epg_live_driver.cpp'),
+                            str(ROOT / 'src/si4684.cpp'), str(ROOT / 'src/epg_core.cpp'),
+                            str(ROOT / 'src/epg_live.cpp'), '-o', str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
+            if discovery:
+                for fail in range(5):
+                    subprocess.run([str(exe), str(fail)], check=True)
+        print('EPG L0 + L1 + live L2 host suites PASS (no hardware access)', flush=True)
 
 
 if __name__ == '__main__':

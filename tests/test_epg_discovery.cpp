@@ -130,6 +130,7 @@ int main() {
   assert(!d.observe(0x2AA1,10,0,60) && !d.observe(0x2AA1,10,1,0));
   assert(d.inventory(list.data(),list.size(),601) && d.generation()==token);
   d.refresh(60599);assert(d.finished());d.refresh(60600);assert(d.status()==Status::Pending);
+  assert(d.confirmed()==1); // periodic re-query must not revoke existing proof
   assert(d.generation()!=token && !d.commit(token,spi,4,1,true,60600));
   // Every truncated list is incomplete, never an absence claim.
   for(size_t n=0;n<list.size();++n) {

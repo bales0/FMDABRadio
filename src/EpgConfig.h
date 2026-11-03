@@ -1,7 +1,11 @@
 #pragma once
-// Programme core only: opt-in does not instantiate it or enable acquisition.
+// Live runtime is enabled on the target; isolated legacy host suites opt in.
 #ifndef EPG_ENABLE
+#ifdef FMDAB_HOST_TEST
 #define EPG_ENABLE 0
+#else
+#define EPG_ENABLE 1
+#endif
 #endif
 
 // L1 signalling queries and passive diagnostics. Independent of the programme
